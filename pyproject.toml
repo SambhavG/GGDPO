@@ -1,0 +1,18 @@
+[project]
+name = "cs329h-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.1.0",
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.5",
+    "plotly>=6.5.0",
+    "ruff>=0.14.6",
+    "scikit-learn>=1.7.2",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+    "ty>=0.0.1a27",
+]
