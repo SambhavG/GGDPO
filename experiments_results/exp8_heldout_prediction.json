@@ -1,0 +1,72 @@
+[
+  {
+    "K": 19,
+    "N": 20,
+    "heldout_size": 171,
+    "bt_heldout_accuracy_mean": 0.7494152046783625,
+    "bt_heldout_accuracy_std": 0.042504402836132264,
+    "dpo_heldout_agreement_mean": 0.7304093567251462,
+    "dpo_heldout_agreement_std": 0.05797737619042856,
+    "ggdpo_heldout_agreement_mean": 0.7450292397660819,
+    "ggdpo_heldout_agreement_std": 0.04023629803922708,
+    "dpo_full_agreement_mean": 0.7573684210526317,
+    "ggdpo_full_agreement_mean": 0.7705263157894737,
+    "heldout_improvement": 0.014619883040935755
+  },
+  {
+    "K": 30,
+    "N": 20,
+    "heldout_size": 160,
+    "bt_heldout_accuracy_mean": 0.8012500000000001,
+    "bt_heldout_accuracy_std": 0.03980420832022663,
+    "dpo_heldout_agreement_mean": 0.7856250000000001,
+    "dpo_heldout_agreement_std": 0.04784823011355803,
+    "ggdpo_heldout_agreement_mean": 0.79875,
+    "ggdpo_heldout_agreement_std": 0.042600982969879936,
+    "dpo_full_agreement_mean": 0.8194736842105262,
+    "ggdpo_full_agreement_mean": 0.8294736842105263,
+    "heldout_improvement": 0.013124999999999831
+  },
+  {
+    "K": 40,
+    "N": 20,
+    "heldout_size": 150,
+    "bt_heldout_accuracy_mean": 0.852,
+    "bt_heldout_accuracy_std": 0.03512517299285197,
+    "dpo_heldout_agreement_mean": 0.8426666666666668,
+    "dpo_heldout_agreement_std": 0.04249967320135793,
+    "ggdpo_heldout_agreement_mean": 0.8463333333333335,
+    "ggdpo_heldout_agreement_std": 0.0369067894988322,
+    "dpo_full_agreement_mean": 0.875263157894737,
+    "ggdpo_full_agreement_mean": 0.876578947368421,
+    "heldout_improvement": 0.003666666666666707
+  },
+  {
+    "K": 60,
+    "N": 20,
+    "heldout_size": 130,
+    "bt_heldout_accuracy_mean": 0.865,
+    "bt_heldout_accuracy_std": 0.03444187282292146,
+    "dpo_heldout_agreement_mean": 0.861923076923077,
+    "dpo_heldout_agreement_std": 0.03644522517243957,
+    "ggdpo_heldout_agreement_mean": 0.8634615384615385,
+    "ggdpo_heldout_agreement_std": 0.038682060120266724,
+    "dpo_full_agreement_mean": 0.9031578947368422,
+    "ggdpo_full_agreement_mean": 0.9028947368421052,
+    "heldout_improvement": 0.0015384615384614886
+  },
+  {
+    "K": 95,
+    "N": 20,
+    "heldout_size": 95,
+    "bt_heldout_accuracy_mean": 0.913684210526316,
+    "bt_heldout_accuracy_std": 0.0315086937833595,
+    "dpo_heldout_agreement_mean": 0.9136842105263158,
+    "dpo_heldout_agreement_std": 0.03133237066555204,
+    "ggdpo_heldout_agreement_mean": 0.9036842105263159,
+    "ggdpo_heldout_agreement_std": 0.03299878281982576,
+    "dpo_full_agreement_mean": 0.9478947368421053,
+    "ggdpo_full_agreement_mean": 0.9428947368421055,
+    "heldout_improvement": -0.009999999999999898
+  }
+]

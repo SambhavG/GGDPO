@@ -1,14 +1,18 @@
 """
-GGDPO Experiments - Modal Runner
-Runs all proposed experiments on Modal with H200 GPU.
+GGDPO Experiments v2 - Modal Runner
+Redesigned experiments proving GGDPO's value through rigorous evaluation.
+
+All experiments compare DPO vs GGDPO at the SAME oracle budget.
 
 Usage:
-    modal deploy experiments_modal.py
-    modal run experiments_modal.py::exp1_synthetic_sweep
+    modal run experiments_modal.py::exp1_sample_efficiency
     modal run experiments_modal.py::exp2_scaling_n
-    modal run experiments_modal.py::exp3_ablations
-    modal run experiments_modal.py::exp4_reward_model_scaled
+    modal run experiments_modal.py::exp3_bt_ablation
+    modal run experiments_modal.py::exp4_real_model_scaled
     modal run experiments_modal.py::exp5_ultrafeedback
+    modal run experiments_modal.py::exp6_gradient_variance
+    modal run experiments_modal.py::exp7_noisy_oracle
+    modal run experiments_modal.py::exp8_heldout_prediction
 """
 
 import modal
@@ -53,56 +57,31 @@ COMMON_KWARGS = dict(
 
 def _ggdpo_helpers():
     """Returns a dict of helper functions. Call inside Modal functions."""
-    import copy
     import random
-    import string
     import numpy as np
     import torch
     import torch.nn as nn
     from scipy.stats import kendalltau, spearmanr
 
     def sample_pairs_random(n_completions, n_pairs):
+        """Sample random unique unordered pairs, ensuring every item appears at least once."""
         pairs = []
         existing = set()
         max_possible = n_completions * (n_completions - 1) // 2
         n_pairs = min(n_pairs, max_possible)
-        while len(pairs) < n_pairs:
-            idx = np.random.choice(n_completions, 2, replace=False)
-            idx = tuple(sorted(idx))
-            if idx not in existing:
-                existing.add(idx)
-                pairs.append(idx)
-        return pairs
 
-    def sample_pairs_chain(n_completions, n_pairs):
-        """Chain: compare consecutive items, then random extras."""
-        pairs = []
-        existing = set()
-        perm = np.random.permutation(n_completions)
-        for k in range(min(n_completions - 1, n_pairs)):
-            pair = tuple(sorted((int(perm[k]), int(perm[k + 1]))))
+        # First ensure coverage: each item appears in at least one pair
+        items = list(range(n_completions))
+        random.shuffle(items)
+        for k in range(n_completions - 1):
+            pair = tuple(sorted((items[k], items[k + 1])))
             if pair not in existing:
                 existing.add(pair)
                 pairs.append(pair)
-        while len(pairs) < n_pairs:
-            idx = np.random.choice(n_completions, 2, replace=False)
-            idx = tuple(sorted(idx))
-            if idx not in existing:
-                existing.add(idx)
-                pairs.append(idx)
-        return pairs
+            if len(pairs) >= n_pairs:
+                break
 
-    def sample_pairs_star(n_completions, n_pairs):
-        """Star: one hub item compared to all others, then random extras."""
-        pairs = []
-        existing = set()
-        hub = np.random.randint(n_completions)
-        for i in range(n_completions):
-            if i != hub and len(pairs) < n_pairs:
-                pair = tuple(sorted((hub, i)))
-                if pair not in existing:
-                    existing.add(pair)
-                    pairs.append(pair)
+        # Fill remaining with random pairs
         while len(pairs) < n_pairs:
             idx = np.random.choice(n_completions, 2, replace=False)
             idx = tuple(sorted(idx))
@@ -140,7 +119,6 @@ def _ggdpo_helpers():
         return scores_np
 
     def fit_win_rate(n_completions, labeled_pairs):
-        """Simple win-rate estimation (no BT model)."""
         wins = np.zeros(n_completions)
         counts = np.zeros(n_completions)
         for w, l in labeled_pairs:
@@ -148,22 +126,20 @@ def _ggdpo_helpers():
             counts[w] += 1
             counts[l] += 1
         scores = np.where(counts > 0, wins / counts, 0.5)
-        scores = (scores - scores.mean()) / (scores.std() + 1e-8)
+        std = scores.std()
+        if std > 1e-8:
+            scores = (scores - scores.mean()) / std
         return scores
 
     def fit_transitive_closure(n_completions, labeled_pairs):
-        """Transitive closure: infer from direct comparisons + transitivity."""
-        # Build adjacency: adj[i][j] = True means i > j observed
         adj = np.zeros((n_completions, n_completions), dtype=bool)
         for w, l in labeled_pairs:
             adj[w][l] = True
-        # Warshall's algorithm for transitive closure
         for k in range(n_completions):
             for i in range(n_completions):
                 for j in range(n_completions):
                     if adj[i][k] and adj[k][j]:
                         adj[i][j] = True
-        # Scores = number of items beaten
         scores = adj.sum(axis=1).astype(float)
         std = scores.std()
         if std > 1e-8:
@@ -181,22 +157,6 @@ def _ggdpo_helpers():
                     pairs.append((j, i))
         return pairs
 
-    def construct_weighted_graph(scores):
-        """Construct full graph with confidence weights based on score gaps."""
-        n = len(scores)
-        pairs = []
-        weights = []
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                gap = abs(scores[i] - scores[j])
-                weight = float(1.0 / (1.0 + np.exp(-gap)))  # sigmoid of gap
-                if scores[i] > scores[j]:
-                    pairs.append((i, j))
-                else:
-                    pairs.append((j, i))
-                weights.append(weight)
-        return pairs, weights
-
     def get_log_prob_sums(model, input_ids, attention_mask):
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits[:, :-1, :]
@@ -207,18 +167,13 @@ def _ggdpo_helpers():
         return (token_log_probs * mask).sum(dim=-1)
 
     def train_dpo(policy_model, ref_log_probs_tensor, input_ids_all, attention_mask_all,
-                  pairs, epochs=300, lr=1e-5, beta=0.1, weights=None, device="cuda",
+                  pairs, epochs=300, lr=1e-5, beta=0.1, device="cuda",
                   model_is_bf16=False):
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
         winners = torch.tensor([w for w, _ in pairs], dtype=torch.long, device=device)
         losers = torch.tensor([l for _, l in pairs], dtype=torch.long, device=device)
-        if weights is not None:
-            w_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
-        else:
-            w_tensor = None
 
         log_probs_over_time = []
-        # BFloat16 models don't support GradScaler
         use_amp = (device == "cuda") and (not model_is_bf16)
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -230,10 +185,8 @@ def _ggdpo_helpers():
                 policy_l = policy_log_probs[losers]
                 ref_w = ref_log_probs_tensor[winners]
                 ref_l = ref_log_probs_tensor[losers]
-                logits = beta * ((policy_w - ref_w) - (policy_l - ref_l))
-                losses = -nn.functional.logsigmoid(logits)
-                if w_tensor is not None:
-                    losses = losses * w_tensor
+                dpo_logits = beta * ((policy_w - ref_w) - (policy_l - ref_l))
+                losses = -nn.functional.logsigmoid(dpo_logits)
                 loss = losses.mean()
             if use_amp:
                 scaler.scale(loss).backward()
@@ -260,7 +213,6 @@ def _ggdpo_helpers():
         return agreements, total
 
     def compute_ranking_metrics(model_scores, oracle_scores):
-        """Compute pairwise agreement, Kendall tau, Spearman rho."""
         agree, total = count_pair_agreements(model_scores, oracle_scores)
         frac = agree / total if total > 0 else 0.0
         tau, _ = kendalltau(model_scores, oracle_scores)
@@ -269,14 +221,11 @@ def _ggdpo_helpers():
 
     return {
         "sample_pairs_random": sample_pairs_random,
-        "sample_pairs_chain": sample_pairs_chain,
-        "sample_pairs_star": sample_pairs_star,
         "label_pairs": label_pairs,
         "fit_bradley_terry": fit_bradley_terry,
         "fit_win_rate": fit_win_rate,
         "fit_transitive_closure": fit_transitive_closure,
         "construct_full_graph": construct_full_graph,
-        "construct_weighted_graph": construct_weighted_graph,
         "get_log_prob_sums": get_log_prob_sums,
         "train_dpo": train_dpo,
         "count_pair_agreements": count_pair_agreements,
@@ -285,14 +234,16 @@ def _ggdpo_helpers():
 
 
 # ============================================================
-# Experiment 1: Synthetic N/K Sweep + Noise + Graph Structures
+# Experiment 1: Core Sample Efficiency (Same Oracle Budget)
 # ============================================================
 
 @app.function(**COMMON_KWARGS)
-def exp1_synthetic_sweep():
+def exp1_sample_efficiency():
     """
-    Strengthened synthetic experiment with GPT-2.
-    Sweeps: N, K/N ratio, noise levels, graph sampling structures.
+    Core proof: GGDPO achieves higher agreement than DPO at the same oracle budget.
+    N=15 completions, sweep K (oracle pairs).
+    At low K, GGDPO has 105 training pairs vs K for DPO.
+    At K=105 (all pairs), they converge.
     """
     import copy
     import random
@@ -318,246 +269,23 @@ def exp1_synthetic_sweep():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Sweep configurations
-    N_values = [10, 20, 50]
-    K_ratios = [0.5, 1.0, 2.0, 3.0]
-    noise_levels = [0.0, 0.1, 0.2]
-    NUM_RUNS = 5
-    EPOCHS = 200
-
-    results = []
-    total_configs = len(N_values) * len(K_ratios) * len(noise_levels)
-    config_idx = 0
-
-    for N in N_values:
-        for k_ratio in K_ratios:
-            K = max(N - 1, int(N * k_ratio))  # at least N-1 for connectivity
-            max_possible = N * (N - 1) // 2
-            K = min(K, max_possible)
-
-            for noise in noise_levels:
-                config_idx += 1
-                print(f"\n=== Config {config_idx}/{total_configs}: N={N}, K={K} (ratio={k_ratio}), noise={noise} ===")
-
-                run_results = {"dpo_agreement": [], "ggdpo_agreement": [],
-                               "dpo_kendall": [], "ggdpo_kendall": [],
-                               "dpo_variance": [], "ggdpo_variance": [],
-                               "bt_accuracy": []}
-
-                for run_idx in range(NUM_RUNS):
-                    seed = BASE_SEED + run_idx + config_idx * 100
-                    torch.manual_seed(seed)
-                    np.random.seed(seed)
-                    random.seed(seed)
-
-                    prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
-
-                    # Fresh models
-                    pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
-                    pi_ref.config.use_cache = False
-                    pi_ref.eval()
-
-                    pi_dpo = copy.deepcopy(pi_ref).train()
-                    pi_ggdpo = copy.deepcopy(pi_ref).train()
-
-                    # Generate completions
-                    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-                    completions = []
-                    with torch.no_grad():
-                        for _ in range(N):
-                            out = pi_ref.generate(
-                                **{k: v.clone() for k, v in inputs.items()},
-                                max_length=20, do_sample=True, top_k=50,
-                                pad_token_id=tokenizer.eos_token_id
-                            )
-                            completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
-
-                    # Oracle ranking
-                    perm = np.random.permutation(N)
-                    oracle_scores = np.empty(N)
-                    for rank, idx in enumerate(perm):
-                        oracle_scores[idx] = rank + 1
-
-                    # Sample and label pairs
-                    sampled_pairs = h["sample_pairs_random"](N, K)
-                    labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores, noise_prob=noise)
-
-                    # BT estimation
-                    bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
-                    bt_agree, bt_total = h["count_pair_agreements"](bt_scores, oracle_scores)
-                    run_results["bt_accuracy"].append(bt_agree / bt_total)
-
-                    # Full graph from BT
-                    full_graph = h["construct_full_graph"](bt_scores)
-
-                    # Tokenize
-                    tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
-                    ids = tokens["input_ids"].to(device)
-                    mask = tokens["attention_mask"].to(device)
-
-                    with torch.no_grad():
-                        ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
-
-                    # Train DPO
-                    dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs,
-                                             epochs=EPOCHS, device=device)
-                    # Train GGDPO
-                    ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, full_graph,
-                                               epochs=EPOCHS, device=device)
-
-                    # Final metrics
-                    dpo_final = np.array(dpo_lps[-1])
-                    ggdpo_final = np.array(ggdpo_lps[-1])
-
-                    dpo_metrics = h["compute_ranking_metrics"](dpo_final, oracle_scores)
-                    ggdpo_metrics = h["compute_ranking_metrics"](ggdpo_final, oracle_scores)
-
-                    run_results["dpo_agreement"].append(dpo_metrics["pairwise_agreement"])
-                    run_results["ggdpo_agreement"].append(ggdpo_metrics["pairwise_agreement"])
-                    run_results["dpo_kendall"].append(dpo_metrics["kendall_tau"])
-                    run_results["ggdpo_kendall"].append(ggdpo_metrics["kendall_tau"])
-
-                    # Variance of updates post-convergence
-                    if EPOCHS > 50:
-                        dpo_fracs = []
-                        ggdpo_fracs = []
-                        for e in range(50, EPOCHS):
-                            da, dt = h["count_pair_agreements"](np.array(dpo_lps[e]), oracle_scores)
-                            ga, _ = h["count_pair_agreements"](np.array(ggdpo_lps[e]), oracle_scores)
-                            dpo_fracs.append(da / dt)
-                            ggdpo_fracs.append(ga / dt)
-                        run_results["dpo_variance"].append(float(np.var(np.diff(dpo_fracs))))
-                        run_results["ggdpo_variance"].append(float(np.var(np.diff(ggdpo_fracs))))
-
-                    del pi_ref, pi_dpo, pi_ggdpo
-                    torch.cuda.empty_cache()
-
-                    print(f"  Run {run_idx+1}/{NUM_RUNS}: DPO={dpo_metrics['pairwise_agreement']:.3f} GGDPO={ggdpo_metrics['pairwise_agreement']:.3f} BT_acc={bt_agree/bt_total:.3f}")
-
-                # Average over runs
-                result = {
-                    "N": N, "K": K, "k_ratio": k_ratio, "noise": noise,
-                    "dpo_agreement_mean": float(np.mean(run_results["dpo_agreement"])),
-                    "dpo_agreement_std": float(np.std(run_results["dpo_agreement"])),
-                    "ggdpo_agreement_mean": float(np.mean(run_results["ggdpo_agreement"])),
-                    "ggdpo_agreement_std": float(np.std(run_results["ggdpo_agreement"])),
-                    "dpo_kendall_mean": float(np.mean(run_results["dpo_kendall"])),
-                    "ggdpo_kendall_mean": float(np.mean(run_results["ggdpo_kendall"])),
-                    "bt_accuracy_mean": float(np.mean(run_results["bt_accuracy"])),
-                    "dpo_variance_mean": float(np.mean(run_results["dpo_variance"])) if run_results["dpo_variance"] else 0,
-                    "ggdpo_variance_mean": float(np.mean(run_results["ggdpo_variance"])) if run_results["ggdpo_variance"] else 0,
-                }
-                results.append(result)
-                print(f"  Avg: DPO={result['dpo_agreement_mean']:.3f} GGDPO={result['ggdpo_agreement_mean']:.3f}")
-
-    # Save results
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(f"{RESULTS_DIR}/exp1_synthetic_sweep.json", "w") as f:
-        json.dump(results, f, indent=2)
-    results_vol.commit()
-
-    # Generate plots
-    # Plot 1: N/K ratio vs agreement (no noise)
-    fig, axes = plt.subplots(1, len(N_values), figsize=(5 * len(N_values), 4), sharey=True)
-    if len(N_values) == 1:
-        axes = [axes]
-    for ax, N in zip(axes, N_values):
-        no_noise = [r for r in results if r["N"] == N and r["noise"] == 0.0]
-        ratios = [r["k_ratio"] for r in no_noise]
-        dpo_means = [r["dpo_agreement_mean"] for r in no_noise]
-        ggdpo_means = [r["ggdpo_agreement_mean"] for r in no_noise]
-        ax.plot(ratios, dpo_means, "o-", label="DPO", color="tab:blue")
-        ax.plot(ratios, ggdpo_means, "x-", label="GGDPO", color="tab:orange")
-        ax.set_xlabel("K/N ratio")
-        ax.set_ylabel("Pairwise Agreement")
-        ax.set_title(f"N={N}")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    plt.suptitle("Sample Efficiency: DPO vs GGDPO (no noise)")
-    plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp1_nk_sweep.png", dpi=150)
-    plt.close()
-
-    # Plot 2: Noise robustness
-    fig, axes = plt.subplots(1, len(N_values), figsize=(5 * len(N_values), 4), sharey=True)
-    if len(N_values) == 1:
-        axes = [axes]
-    for ax, N in zip(axes, N_values):
-        for noise in noise_levels:
-            subset = [r for r in results if r["N"] == N and r["noise"] == noise]
-            ratios = [r["k_ratio"] for r in subset]
-            ggdpo_means = [r["ggdpo_agreement_mean"] for r in subset]
-            ax.plot(ratios, ggdpo_means, "x-", label=f"GGDPO noise={noise}")
-        ax.set_xlabel("K/N ratio")
-        ax.set_ylabel("Pairwise Agreement")
-        ax.set_title(f"N={N}")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    plt.suptitle("GGDPO Noise Robustness")
-    plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp1_noise_robustness.png", dpi=150)
-    plt.close()
-
-    results_vol.commit()
-    print("\n=== Experiment 1 Complete ===")
-    print(json.dumps(results, indent=2))
-    return results
-
-
-# ============================================================
-# Experiment 2: Scaling N (the "killer chart")
-# ============================================================
-
-@app.function(**COMMON_KWARGS)
-def exp2_scaling_n():
-    """
-    Shows GGDPO advantage grows as n increases.
-    The key chart for the paper.
-    """
-    import copy
-    import random
-    import string
-    import json
-    import os
-    import numpy as np
-    import torch
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
-    device = "cuda"
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    h = _ggdpo_helpers()
-    BASE_SEED = 44
-
-    model_name = "gpt2"
-    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    N_values = [4, 8, 16, 32, 64]
-    NUM_RUNS = 10
+    N = 15
+    MAX_PAIRS = N * (N - 1) // 2  # 105
+    K_values = [N - 1, N, 2 * N, 3 * N, MAX_PAIRS]  # [14, 15, 30, 45, 105]
+    NUM_RUNS = 20
     EPOCHS = 200
 
     results = []
 
-    for N in N_values:
-        K = 2 * N  # Linear in N
-        max_possible = N * (N - 1) // 2
-        K = min(K, max_possible)
-        total_possible_pairs = max_possible
+    for K in K_values:
+        K = min(K, MAX_PAIRS)
+        print(f"\n=== K={K} oracle pairs (N={N}, max={MAX_PAIRS}) ===")
 
-        print(f"\n=== N={N}, K={K}, total_possible={total_possible_pairs} ===")
-
-        run_data = {"dpo": [], "ggdpo": [], "full_dpo": [], "bt_acc": [],
-                    "dpo_kendall": [], "ggdpo_kendall": [], "full_dpo_kendall": [],
-                    "dpo_over_time": [], "ggdpo_over_time": [], "full_dpo_over_time": []}
+        run_data = {"dpo_agreement": [], "ggdpo_agreement": [],
+                    "dpo_kendall": [], "ggdpo_kendall": []}
 
         for run_idx in range(NUM_RUNS):
-            seed = BASE_SEED + run_idx + N * 1000
+            seed = BASE_SEED + run_idx + K * 100
             torch.manual_seed(seed)
             np.random.seed(seed)
             random.seed(seed)
@@ -567,177 +295,125 @@ def exp2_scaling_n():
             pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
             pi_ref.config.use_cache = False
             pi_ref.eval()
-
             pi_dpo = copy.deepcopy(pi_ref).train()
             pi_ggdpo = copy.deepcopy(pi_ref).train()
-            pi_full = copy.deepcopy(pi_ref).train()
 
-            # Generate completions
-            completions = []
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            completions = []
             with torch.no_grad():
                 for _ in range(N):
                     out = pi_ref.generate(
-                        **{k: v.clone() for k, v in inputs.items()},
+                        **{kk: v.clone() for kk, v in inputs.items()},
                         max_length=20, do_sample=True, top_k=50,
                         pad_token_id=tokenizer.eos_token_id
                     )
                     completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
 
-            # Oracle
             perm = np.random.permutation(N)
             oracle_scores = np.empty(N)
             for rank, idx in enumerate(perm):
                 oracle_scores[idx] = rank + 1
 
-            # Sample K pairs
             sampled_pairs = h["sample_pairs_random"](N, K)
             labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
 
-            # Full oracle pairs (upper bound)
-            all_pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
-            full_labeled = h["label_pairs"](all_pairs, oracle_scores)
-
-            # BT estimation
             bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
-            bt_agree, bt_total = h["count_pair_agreements"](bt_scores, oracle_scores)
-            run_data["bt_acc"].append(bt_agree / bt_total)
-
             full_graph = h["construct_full_graph"](bt_scores)
 
-            # Tokenize
             tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
             ids = tokens["input_ids"].to(device)
             mask = tokens["attention_mask"].to(device)
+
             with torch.no_grad():
                 ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
 
-            # Train all three
-            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs, epochs=EPOCHS, device=device)
-            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, full_graph, epochs=EPOCHS, device=device)
-            full_lps = h["train_dpo"](pi_full, ref_lp, ids, mask, full_labeled, epochs=EPOCHS, device=device)
+            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs,
+                                     epochs=EPOCHS, device=device)
+            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, full_graph,
+                                       epochs=EPOCHS, device=device)
 
-            # Final metrics
-            dpo_m = h["compute_ranking_metrics"](np.array(dpo_lps[-1]), oracle_scores)
-            ggdpo_m = h["compute_ranking_metrics"](np.array(ggdpo_lps[-1]), oracle_scores)
-            full_m = h["compute_ranking_metrics"](np.array(full_lps[-1]), oracle_scores)
+            dpo_final = np.array(dpo_lps[-1])
+            ggdpo_final = np.array(ggdpo_lps[-1])
 
-            run_data["dpo"].append(dpo_m["pairwise_agreement"])
-            run_data["ggdpo"].append(ggdpo_m["pairwise_agreement"])
-            run_data["full_dpo"].append(full_m["pairwise_agreement"])
+            dpo_m = h["compute_ranking_metrics"](dpo_final, oracle_scores)
+            ggdpo_m = h["compute_ranking_metrics"](ggdpo_final, oracle_scores)
+
+            run_data["dpo_agreement"].append(dpo_m["pairwise_agreement"])
+            run_data["ggdpo_agreement"].append(ggdpo_m["pairwise_agreement"])
             run_data["dpo_kendall"].append(dpo_m["kendall_tau"])
             run_data["ggdpo_kendall"].append(ggdpo_m["kendall_tau"])
-            run_data["full_dpo_kendall"].append(full_m["kendall_tau"])
 
-            # Agreement over time for averaging
-            dpo_time = []
-            ggdpo_time = []
-            full_time = []
-            for e in range(EPOCHS):
-                da, dt = h["count_pair_agreements"](np.array(dpo_lps[e]), oracle_scores)
-                ga, _ = h["count_pair_agreements"](np.array(ggdpo_lps[e]), oracle_scores)
-                fa, _ = h["count_pair_agreements"](np.array(full_lps[e]), oracle_scores)
-                dpo_time.append(da / dt)
-                ggdpo_time.append(ga / dt)
-                full_time.append(fa / dt)
-            run_data["dpo_over_time"].append(dpo_time)
-            run_data["ggdpo_over_time"].append(ggdpo_time)
-            run_data["full_dpo_over_time"].append(full_time)
-
-            del pi_ref, pi_dpo, pi_ggdpo, pi_full
+            del pi_ref, pi_dpo, pi_ggdpo
             torch.cuda.empty_cache()
 
-            print(f"  Run {run_idx+1}: DPO={dpo_m['pairwise_agreement']:.3f} GGDPO={ggdpo_m['pairwise_agreement']:.3f} Full={full_m['pairwise_agreement']:.3f}")
+            if (run_idx + 1) % 5 == 0:
+                print(f"  Run {run_idx+1}/{NUM_RUNS}: DPO={dpo_m['pairwise_agreement']:.3f} GGDPO={ggdpo_m['pairwise_agreement']:.3f}")
 
         result = {
-            "N": N, "K": K, "total_pairs": total_possible_pairs,
-            "dpo_mean": float(np.mean(run_data["dpo"])),
-            "dpo_std": float(np.std(run_data["dpo"])),
-            "ggdpo_mean": float(np.mean(run_data["ggdpo"])),
-            "ggdpo_std": float(np.std(run_data["ggdpo"])),
-            "full_dpo_mean": float(np.mean(run_data["full_dpo"])),
-            "full_dpo_std": float(np.std(run_data["full_dpo"])),
-            "bt_accuracy_mean": float(np.mean(run_data["bt_acc"])),
+            "N": N, "K": K, "max_pairs": MAX_PAIRS,
+            "dpo_agreement_mean": float(np.mean(run_data["dpo_agreement"])),
+            "dpo_agreement_std": float(np.std(run_data["dpo_agreement"])),
+            "ggdpo_agreement_mean": float(np.mean(run_data["ggdpo_agreement"])),
+            "ggdpo_agreement_std": float(np.std(run_data["ggdpo_agreement"])),
             "dpo_kendall_mean": float(np.mean(run_data["dpo_kendall"])),
             "ggdpo_kendall_mean": float(np.mean(run_data["ggdpo_kendall"])),
-            "full_dpo_kendall_mean": float(np.mean(run_data["full_dpo_kendall"])),
-            "dpo_over_time_avg": np.mean(run_data["dpo_over_time"], axis=0).tolist(),
-            "ggdpo_over_time_avg": np.mean(run_data["ggdpo_over_time"], axis=0).tolist(),
-            "full_dpo_over_time_avg": np.mean(run_data["full_dpo_over_time"], axis=0).tolist(),
+            "improvement": float(np.mean(run_data["ggdpo_agreement"]) - np.mean(run_data["dpo_agreement"])),
         }
         results.append(result)
-        print(f"  Avg: DPO={result['dpo_mean']:.3f} GGDPO={result['ggdpo_mean']:.3f} Full={result['full_dpo_mean']:.3f}")
+        print(f"  K={K}: DPO={result['dpo_agreement_mean']:.3f}+-{result['dpo_agreement_std']:.3f} "
+              f"GGDPO={result['ggdpo_agreement_mean']:.3f}+-{result['ggdpo_agreement_std']:.3f} "
+              f"Improvement={result['improvement']:+.3f}")
 
-    # Save
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(f"{RESULTS_DIR}/exp2_scaling_n.json", "w") as f:
+    # Save JSON
+    with open(os.path.join(RESULTS_DIR, "exp1_sample_efficiency.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Killer chart: Final agreement vs N
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    ns = [r["N"] for r in results]
-    dpo_means = [r["dpo_mean"] for r in results]
-    dpo_stds = [r["dpo_std"] for r in results]
-    ggdpo_means = [r["ggdpo_mean"] for r in results]
-    ggdpo_stds = [r["ggdpo_std"] for r in results]
-    full_means = [r["full_dpo_mean"] for r in results]
-    full_stds = [r["full_dpo_std"] for r in results]
+    Ks = [r["K"] for r in results]
+    dpo_means = [r["dpo_agreement_mean"] for r in results]
+    dpo_stds = [r["dpo_agreement_std"] for r in results]
+    ggdpo_means = [r["ggdpo_agreement_mean"] for r in results]
+    ggdpo_stds = [r["ggdpo_agreement_std"] for r in results]
+    improvements = [r["improvement"] for r in results]
 
-    ax1.errorbar(ns, dpo_means, yerr=dpo_stds, fmt="o-", label="DPO (K=2N pairs)", capsize=3)
-    ax1.errorbar(ns, ggdpo_means, yerr=ggdpo_stds, fmt="x-", label="GGDPO (K=2N -> N(N-1)/2)", capsize=3)
-    ax1.errorbar(ns, full_means, yerr=full_stds, fmt="s--", label="Full DPO (all N(N-1)/2 pairs)", capsize=3, alpha=0.7)
-    ax1.set_xlabel("N (completions per prompt)")
-    ax1.set_ylabel("Final Pairwise Agreement with Oracle")
-    ax1.set_title("GGDPO Advantage Grows with N")
+    ax1.errorbar(Ks, dpo_means, yerr=dpo_stds, marker='o', capsize=4, label='DPO (K pairs)')
+    ax1.errorbar(Ks, ggdpo_means, yerr=ggdpo_stds, marker='x', capsize=4, label='GGDPO (K -> 105 pairs)')
+    ax1.set_xlabel("K (oracle pairs)")
+    ax1.set_ylabel("Oracle Pairwise Agreement")
+    ax1.set_title(f"Sample Efficiency: N={N} completions")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # Gap plot
-    gaps = [g - d for g, d in zip(ggdpo_means, dpo_means)]
-    ax2.bar(range(len(ns)), gaps, tick_label=[str(n) for n in ns], color="tab:green", alpha=0.7)
-    ax2.set_xlabel("N")
-    ax2.set_ylabel("GGDPO - DPO Agreement Gap")
-    ax2.set_title("GGDPO Improvement Over DPO")
-    ax2.grid(True, alpha=0.3, axis="y")
+    bar_colors = ['green' if v > 0 else 'red' for v in improvements]
+    ax2.bar([str(k) for k in Ks], improvements, color=bar_colors, alpha=0.7)
+    ax2.set_xlabel("K (oracle pairs)")
+    ax2.set_ylabel("GGDPO - DPO Agreement")
+    ax2.set_title("GGDPO Improvement over DPO")
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp2_scaling_n.png", dpi=150)
-    plt.close()
-
-    # Training curves for each N
-    fig, axes = plt.subplots(1, len(N_values), figsize=(4 * len(N_values), 4), sharey=True)
-    if len(N_values) == 1:
-        axes = [axes]
-    for ax, r in zip(axes, results):
-        epochs_x = list(range(EPOCHS))
-        ax.plot(epochs_x, r["dpo_over_time_avg"], label="DPO", alpha=0.8)
-        ax.plot(epochs_x, r["ggdpo_over_time_avg"], label="GGDPO", alpha=0.8)
-        ax.plot(epochs_x, r["full_dpo_over_time_avg"], label="Full DPO", alpha=0.5, linestyle="--")
-        ax.set_xlabel("Epoch")
-        ax.set_title(f"N={r['N']}")
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-    axes[0].set_ylabel("Pairwise Agreement")
-    plt.suptitle("Training Curves: DPO vs GGDPO vs Full DPO")
-    plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp2_training_curves.png", dpi=150)
+    plt.savefig(os.path.join(RESULTS_DIR, "exp1_sample_efficiency.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     results_vol.commit()
-    print("\n=== Experiment 2 (Scaling N) Complete ===")
-    return results
+    print("\n=== Experiment 1 Complete ===")
+    print(json.dumps(results, indent=2))
 
 
 # ============================================================
-# Experiment 3: Ablations (graph estimation methods, weighting)
+# Experiment 2: Scaling-N (The Killer Chart)
 # ============================================================
 
 @app.function(**COMMON_KWARGS)
-def exp3_ablations():
+def exp2_scaling_n():
     """
-    Ablation study: BT vs win-rate vs transitive closure,
-    confidence-weighted DPO, graph structure sampling methods.
+    As N grows, GGDPO advantage should widen.
+    Fixed K=2N oracle pairs, N varies.
+    GGDPO expands to C(N,2) pairs.
+    Includes Full DPO upper bound.
     """
     import copy
     import random
@@ -751,33 +427,1042 @@ def exp3_ablations():
     import matplotlib.pyplot as plt
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
     h = _ggdpo_helpers()
-    BASE_SEED = 44
+    BASE_SEED = 42
 
     model_name = "gpt2"
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    N = 30
-    K = 30
+    N_values = [5, 10, 15, 20, 30, 50]
     NUM_RUNS = 10
     EPOCHS = 200
 
-    # Ablation 1: Graph estimation methods
-    print("\n=== Ablation 1: Graph Estimation Methods ===")
+    results = []
+
+    for N in N_values:
+        K = 2 * N
+        max_pairs = N * (N - 1) // 2
+        K = min(K, max_pairs)
+        print(f"\n=== N={N}, K={K} oracle pairs, C(N,2)={max_pairs} ===")
+
+        run_data = {"dpo_agreement": [], "ggdpo_agreement": [], "full_dpo_agreement": [],
+                    "dpo_kendall": [], "ggdpo_kendall": [], "full_dpo_kendall": []}
+
+        for run_idx in range(NUM_RUNS):
+            seed = BASE_SEED + run_idx + N * 100
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
+
+            pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            pi_ref.config.use_cache = False
+            pi_ref.eval()
+            pi_dpo = copy.deepcopy(pi_ref).train()
+            pi_ggdpo = copy.deepcopy(pi_ref).train()
+            pi_full = copy.deepcopy(pi_ref).train()
+
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            completions = []
+            with torch.no_grad():
+                for _ in range(N):
+                    out = pi_ref.generate(
+                        **{kk: v.clone() for kk, v in inputs.items()},
+                        max_length=20, do_sample=True, top_k=50,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+            perm = np.random.permutation(N)
+            oracle_scores = np.empty(N)
+            for rank, idx in enumerate(perm):
+                oracle_scores[idx] = rank + 1
+
+            sampled_pairs = h["sample_pairs_random"](N, K)
+            labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+
+            bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+            ggdpo_graph = h["construct_full_graph"](bt_scores)
+
+            all_pairs = h["sample_pairs_random"](N, max_pairs)
+            all_labeled = h["label_pairs"](all_pairs, oracle_scores)
+
+            tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+            ids = tokens["input_ids"].to(device)
+            mask = tokens["attention_mask"].to(device)
+
+            with torch.no_grad():
+                ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
+
+            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs,
+                                     epochs=EPOCHS, device=device)
+            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, ggdpo_graph,
+                                       epochs=EPOCHS, device=device)
+            full_lps = h["train_dpo"](pi_full, ref_lp, ids, mask, all_labeled,
+                                      epochs=EPOCHS, device=device)
+
+            dpo_m = h["compute_ranking_metrics"](np.array(dpo_lps[-1]), oracle_scores)
+            ggdpo_m = h["compute_ranking_metrics"](np.array(ggdpo_lps[-1]), oracle_scores)
+            full_m = h["compute_ranking_metrics"](np.array(full_lps[-1]), oracle_scores)
+
+            run_data["dpo_agreement"].append(dpo_m["pairwise_agreement"])
+            run_data["ggdpo_agreement"].append(ggdpo_m["pairwise_agreement"])
+            run_data["full_dpo_agreement"].append(full_m["pairwise_agreement"])
+            run_data["dpo_kendall"].append(dpo_m["kendall_tau"])
+            run_data["ggdpo_kendall"].append(ggdpo_m["kendall_tau"])
+            run_data["full_dpo_kendall"].append(full_m["kendall_tau"])
+
+            del pi_ref, pi_dpo, pi_ggdpo, pi_full
+            torch.cuda.empty_cache()
+
+            if (run_idx + 1) % 5 == 0:
+                print(f"  Run {run_idx+1}/{NUM_RUNS}: DPO={dpo_m['pairwise_agreement']:.3f} "
+                      f"GGDPO={ggdpo_m['pairwise_agreement']:.3f} Full={full_m['pairwise_agreement']:.3f}")
+
+        result = {
+            "N": N, "K": K, "max_pairs": max_pairs,
+            "dpo_agreement_mean": float(np.mean(run_data["dpo_agreement"])),
+            "dpo_agreement_std": float(np.std(run_data["dpo_agreement"])),
+            "ggdpo_agreement_mean": float(np.mean(run_data["ggdpo_agreement"])),
+            "ggdpo_agreement_std": float(np.std(run_data["ggdpo_agreement"])),
+            "full_dpo_agreement_mean": float(np.mean(run_data["full_dpo_agreement"])),
+            "full_dpo_agreement_std": float(np.std(run_data["full_dpo_agreement"])),
+            "improvement_over_dpo": float(np.mean(run_data["ggdpo_agreement"]) - np.mean(run_data["dpo_agreement"])),
+            "gap_to_full": float(np.mean(run_data["full_dpo_agreement"]) - np.mean(run_data["ggdpo_agreement"])),
+        }
+        results.append(result)
+        print(f"  N={N}: DPO={result['dpo_agreement_mean']:.3f} GGDPO={result['ggdpo_agreement_mean']:.3f} "
+              f"Full={result['full_dpo_agreement_mean']:.3f} Improvement={result['improvement_over_dpo']:+.3f}")
+
+    with open(os.path.join(RESULTS_DIR, "exp2_scaling_n.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    Ns = [r["N"] for r in results]
+    dpo_m_list = [r["dpo_agreement_mean"] for r in results]
+    dpo_s = [r["dpo_agreement_std"] for r in results]
+    ggdpo_m_list = [r["ggdpo_agreement_mean"] for r in results]
+    ggdpo_s = [r["ggdpo_agreement_std"] for r in results]
+    full_m_list = [r["full_dpo_agreement_mean"] for r in results]
+    full_s = [r["full_dpo_agreement_std"] for r in results]
+    improvements = [r["improvement_over_dpo"] for r in results]
+
+    ax1.errorbar(Ns, dpo_m_list, yerr=dpo_s, marker='o', capsize=4, label='DPO (K=2N pairs)')
+    ax1.errorbar(Ns, ggdpo_m_list, yerr=ggdpo_s, marker='x', capsize=4, label='GGDPO (K=2N -> C(N,2) pairs)')
+    ax1.errorbar(Ns, full_m_list, yerr=full_s, marker='s', capsize=4, linestyle='--', label='Full DPO (all C(N,2) pairs)')
+    ax1.set_xlabel("N (completions per prompt)")
+    ax1.set_ylabel("Oracle Pairwise Agreement")
+    ax1.set_title("GGDPO Advantage Grows with N")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    bar_colors = ['green' if v > 0 else 'red' for v in improvements]
+    ax2.bar([str(n) for n in Ns], improvements, color=bar_colors, alpha=0.7)
+    ax2.set_xlabel("N")
+    ax2.set_ylabel("GGDPO - DPO Agreement")
+    ax2.set_title("GGDPO Improvement over DPO")
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp2_scaling_n.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+    print("\n=== Experiment 2 Complete ===")
+    print(json.dumps(results, indent=2))
+
+
+# ============================================================
+# Experiment 3: BT Estimation Ablation
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp3_bt_ablation():
+    """
+    Justify Bradley-Terry as the graph estimation method.
+    Compare BT vs Win Rate vs Transitive Closure vs DPO baseline.
+    Also: K sweep showing BT accuracy vs #pairs.
+    """
+    import copy
+    import random
+    import string
+    import json
+    import os
+    import numpy as np
+    import torch
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    h = _ggdpo_helpers()
+    BASE_SEED = 42
+
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    N = 20
+    MAX_PAIRS = N * (N - 1) // 2  # 190
+    NUM_RUNS = 20
+    EPOCHS = 200
+
+    # Part 1: Compare graph estimation methods at K=20
+    print("=== Part 1: Graph Estimation Methods ===")
+    K_fixed = 20
     methods = {
         "bradley_terry": h["fit_bradley_terry"],
         "win_rate": h["fit_win_rate"],
         "transitive_closure": h["fit_transitive_closure"],
     }
+    method_results = {}
 
-    method_results = {name: {"agreement": [], "kendall": []} for name in methods}
-    method_results["dpo_baseline"] = {"agreement": [], "kendall": []}
+    for method_name, fit_fn in methods.items():
+        run_data = {"agreement": [], "kendall": []}
+        for run_idx in range(NUM_RUNS):
+            seed = BASE_SEED + run_idx
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
+            pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            pi_ref.config.use_cache = False
+            pi_ref.eval()
+            pi_model = copy.deepcopy(pi_ref).train()
+
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            completions = []
+            with torch.no_grad():
+                for _ in range(N):
+                    out = pi_ref.generate(
+                        **{kk: v.clone() for kk, v in inputs.items()},
+                        max_length=20, do_sample=True, top_k=50,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+            perm = np.random.permutation(N)
+            oracle_scores = np.empty(N)
+            for rank, idx in enumerate(perm):
+                oracle_scores[idx] = rank + 1
+
+            sampled_pairs = h["sample_pairs_random"](N, K_fixed)
+            labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+
+            est_scores = fit_fn(N, labeled_pairs)
+            full_graph = h["construct_full_graph"](est_scores)
+
+            tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+            ids = tokens["input_ids"].to(device)
+            mask_tensor = tokens["attention_mask"].to(device)
+
+            with torch.no_grad():
+                ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask_tensor)
+
+            lps = h["train_dpo"](pi_model, ref_lp, ids, mask_tensor, full_graph,
+                                 epochs=EPOCHS, device=device)
+
+            m = h["compute_ranking_metrics"](np.array(lps[-1]), oracle_scores)
+            run_data["agreement"].append(m["pairwise_agreement"])
+            run_data["kendall"].append(m["kendall_tau"])
+
+            del pi_ref, pi_model
+            torch.cuda.empty_cache()
+
+        method_results[method_name] = {
+            "agreement_mean": float(np.mean(run_data["agreement"])),
+            "agreement_std": float(np.std(run_data["agreement"])),
+            "kendall_mean": float(np.mean(run_data["kendall"])),
+        }
+        print(f"  {method_name}: agreement={method_results[method_name]['agreement_mean']:.3f}"
+              f"+-{method_results[method_name]['agreement_std']:.3f}")
+
+    # DPO baseline (no expansion)
+    dpo_data = {"agreement": [], "kendall": []}
+    for run_idx in range(NUM_RUNS):
+        seed = BASE_SEED + run_idx
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
+        pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+        pi_ref.config.use_cache = False
+        pi_ref.eval()
+        pi_dpo = copy.deepcopy(pi_ref).train()
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        completions = []
+        with torch.no_grad():
+            for _ in range(N):
+                out = pi_ref.generate(
+                    **{kk: v.clone() for kk, v in inputs.items()},
+                    max_length=20, do_sample=True, top_k=50,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+                completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+        perm = np.random.permutation(N)
+        oracle_scores = np.empty(N)
+        for rank, idx in enumerate(perm):
+            oracle_scores[idx] = rank + 1
+
+        sampled_pairs = h["sample_pairs_random"](N, K_fixed)
+        labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+
+        tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+        ids = tokens["input_ids"].to(device)
+        mask_tensor = tokens["attention_mask"].to(device)
+
+        with torch.no_grad():
+            ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask_tensor)
+
+        lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask_tensor, labeled_pairs,
+                             epochs=EPOCHS, device=device)
+        m = h["compute_ranking_metrics"](np.array(lps[-1]), oracle_scores)
+        dpo_data["agreement"].append(m["pairwise_agreement"])
+        dpo_data["kendall"].append(m["kendall_tau"])
+
+        del pi_ref, pi_dpo
+        torch.cuda.empty_cache()
+
+    method_results["dpo_baseline"] = {
+        "agreement_mean": float(np.mean(dpo_data["agreement"])),
+        "agreement_std": float(np.std(dpo_data["agreement"])),
+        "kendall_mean": float(np.mean(dpo_data["kendall"])),
+    }
+
+    # Part 2: K sweep for BT estimation accuracy
+    print("\n=== Part 2: BT Accuracy vs K ===")
+    K_sweep = [10, 15, 20, 30, 40, 60]
+    bt_k_results = []
+
+    for K in K_sweep:
+        K = min(K, MAX_PAIRS)
+        accuracies = []
+        for run_idx in range(NUM_RUNS):
+            seed = BASE_SEED + run_idx + K * 50
+            np.random.seed(seed)
+            random.seed(seed)
+
+            oracle_scores = np.random.permutation(N).astype(float) + 1
+            sampled_pairs = h["sample_pairs_random"](N, K)
+            labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+            bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+            agree, total = h["count_pair_agreements"](bt_scores, oracle_scores)
+            accuracies.append(agree / total)
+
+        bt_k_results.append({
+            "K": K,
+            "bt_accuracy_mean": float(np.mean(accuracies)),
+            "bt_accuracy_std": float(np.std(accuracies)),
+        })
+        print(f"  K={K}: BT accuracy={np.mean(accuracies):.3f}+-{np.std(accuracies):.3f}")
+
+    all_results = {
+        "graph_estimation_methods": method_results,
+        "bt_accuracy_vs_k": bt_k_results,
+    }
+    with open(os.path.join(RESULTS_DIR, "exp3_bt_ablation.json"), "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    names = list(method_results.keys())
+    means = [method_results[n]["agreement_mean"] for n in names]
+    stds = [method_results[n]["agreement_std"] for n in names]
+    plot_colors = ['#1f77b4', '#2ca02c', '#d62728', '#ff7f0e']
+    ax1.bar(names, means, yerr=stds, capsize=5, color=plot_colors[:len(names)], alpha=0.8)
+    ax1.set_ylabel("Oracle Pairwise Agreement")
+    ax1.set_title(f"Graph Estimation Methods (N={N}, K={K_fixed})")
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    Ks = [r["K"] for r in bt_k_results]
+    bt_means = [r["bt_accuracy_mean"] for r in bt_k_results]
+    bt_stds = [r["bt_accuracy_std"] for r in bt_k_results]
+    ax2.errorbar(Ks, bt_means, yerr=bt_stds, marker='o', capsize=4, color='#1f77b4')
+    ax2.set_xlabel("K (oracle pairs)")
+    ax2.set_ylabel("BT Estimation Accuracy")
+    ax2.set_title(f"BT Accuracy vs Oracle Pairs (N={N})")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp3_bt_ablation.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+    print("\n=== Experiment 3 Complete ===")
+    print(json.dumps(all_results, indent=2))
+
+
+# ============================================================
+# Experiment 4: Real Model at Scale (Qwen3-1.7B + Reward Model)
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp4_real_model_scaled():
+    """
+    Substantially expanded real-model experiment.
+    Qwen3-1.7B on UltraFeedback prompts, LoRA DPO, gradient variance measurement.
+    """
+    import random
+    import json
+    import os
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+    from peft import LoraConfig, get_peft_model, TaskType
+    from datasets import load_dataset
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    h = _ggdpo_helpers()
+
+    model_name = "Qwen/Qwen3-1.7B"
+    reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-1.7B"
+
+    print("Loading tokenizer and reward model...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
+    if reward_tokenizer.pad_token is None:
+        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        reward_model_name, torch_dtype=torch.bfloat16, num_labels=1
+    ).to(device)
+    reward_model.eval()
+
+    print("Loading UltraFeedback prompts...")
+    ds = load_dataset("openbmb/UltraFeedback", split="train")
+    prompts = [ex["instruction"] for ex in ds]
+    random.seed(42)
+    random.shuffle(prompts)
+    prompts = prompts[:200]
+
+    N_values = [10, 20, 30]
+    NUM_RUNS = 3
+    EPOCHS_DPO = 2
+    BATCH_SIZE = 4
+    LR = 5e-6
+
+    results = []
+
+    for N in N_values:
+        K = N
+        max_pairs = N * (N - 1) // 2
+        print(f"\n=== N={N}, K={K}, C(N,2)={max_pairs} ===")
+
+        run_data = {
+            "dpo_reward": [], "ggdpo_reward": [],
+            "dpo_grad_var": [], "ggdpo_grad_var": [],
+        }
+
+        for run_idx in range(NUM_RUNS):
+            seed = 42 + run_idx + N * 10
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            run_prompts = prompts[run_idx * 10:(run_idx + 1) * 10]
+
+            print(f"  Run {run_idx+1}/{NUM_RUNS}: Generating {N} completions per prompt...")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16
+            ).to(device)
+            base_model.eval()
+
+            all_dpo_pairs = []
+            all_ggdpo_pairs = []
+
+            for p_idx, prompt_text in enumerate(run_prompts):
+                inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=256).to(device)
+                completions = []
+                with torch.no_grad():
+                    for _ in range(N):
+                        out = base_model.generate(
+                            **{kk: v.clone() for kk, v in inputs.items()},
+                            max_new_tokens=96, do_sample=True, top_k=50, temperature=0.8,
+                            pad_token_id=tokenizer.pad_token_id
+                        )
+                        text = tokenizer.decode(out[0], skip_special_tokens=True)
+                        completions.append(text)
+
+                scores = []
+                for comp in completions:
+                    enc = reward_tokenizer(comp, return_tensors="pt", truncation=True, max_length=512).to(device)
+                    with torch.no_grad():
+                        score = reward_model(**enc).logits.squeeze().float().item()
+                    scores.append(score)
+                scores = np.array(scores)
+
+                sampled_pairs = h["sample_pairs_random"](N, K)
+                labeled_pairs = h["label_pairs"](sampled_pairs, scores)
+
+                bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+                ggdpo_graph = h["construct_full_graph"](bt_scores)
+
+                for w, l in labeled_pairs:
+                    all_dpo_pairs.append((prompt_text, completions[w], completions[l]))
+                for w, l in ggdpo_graph:
+                    all_ggdpo_pairs.append((prompt_text, completions[w], completions[l]))
+
+                if (p_idx + 1) % 5 == 0:
+                    print(f"    Prompt {p_idx+1}/{len(run_prompts)} processed")
+
+            del base_model
+            torch.cuda.empty_cache()
+
+            print(f"  DPO pairs: {len(all_dpo_pairs)}, GGDPO pairs: {len(all_ggdpo_pairs)}")
+
+            def train_lora_dpo(pairs, label=""):
+                ref_model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16
+                ).to(device)
+                ref_model.eval()
+                for p in ref_model.parameters():
+                    p.requires_grad = False
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16
+                ).to(device)
+                model.config.use_cache = False
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM, r=16, lora_alpha=32,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                    lora_dropout=0.0,
+                )
+                model = get_peft_model(model, lora_config)
+                model.enable_input_require_grads()
+                model.train()
+
+                optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+                total_loss = 0
+                num_batches = 0
+                grad_norms = []
+
+                for epoch in range(EPOCHS_DPO):
+                    random.shuffle(pairs)
+                    for start in range(0, len(pairs), BATCH_SIZE):
+                        batch = pairs[start:start + BATCH_SIZE]
+                        chosen_texts = [f"{p}\n\n{c}" for p, c, _ in batch]
+                        rejected_texts = [f"{p}\n\n{r}" for p, _, r in batch]
+
+                        chosen_enc = tokenizer(chosen_texts, return_tensors="pt", padding=True,
+                                             truncation=True, max_length=512).to(device)
+                        rejected_enc = tokenizer(rejected_texts, return_tensors="pt", padding=True,
+                                               truncation=True, max_length=512).to(device)
+
+                        optimizer.zero_grad()
+
+                        chosen_lp = h["get_log_prob_sums"](model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
+                        rejected_lp = h["get_log_prob_sums"](model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
+
+                        with torch.no_grad():
+                            ref_chosen_lp = h["get_log_prob_sums"](ref_model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
+                            ref_rejected_lp = h["get_log_prob_sums"](ref_model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
+
+                        beta = 0.1
+                        dpo_logits = beta * ((chosen_lp - ref_chosen_lp) - (rejected_lp - ref_rejected_lp))
+                        loss = -nn.functional.logsigmoid(dpo_logits).mean()
+
+                        loss.backward()
+
+                        grad_norm = 0.0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                grad_norm += p.grad.data.norm(2).item() ** 2
+                        grad_norms.append(grad_norm ** 0.5)
+
+                        optimizer.step()
+                        total_loss += loss.item()
+                        num_batches += 1
+
+                        if num_batches % 100 == 0:
+                            print(f"    {label} Epoch {epoch+1}/{EPOCHS_DPO}, Batch {num_batches}, loss={total_loss/num_batches:.4f}")
+
+                avg_loss = total_loss / max(num_batches, 1)
+                grad_variance = float(np.var(grad_norms)) if grad_norms else 0.0
+
+                del ref_model
+                torch.cuda.empty_cache()
+                return model, avg_loss, grad_variance
+
+            print(f"  Training DPO...")
+            dpo_model, dpo_loss, dpo_grad_var = train_lora_dpo(all_dpo_pairs, "DPO")
+            print(f"  Training GGDPO...")
+            ggdpo_model, ggdpo_loss, ggdpo_grad_var = train_lora_dpo(all_ggdpo_pairs, "GGDPO")
+
+            def evaluate_model(model, eval_prompts, n_gen=2, max_new_tokens=96):
+                model.eval()
+                all_scores = []
+                for idx, pt in enumerate(eval_prompts[:20]):
+                    inputs = tokenizer(pt, return_tensors="pt", truncation=True, max_length=256).to(device)
+                    with torch.no_grad():
+                        for _ in range(n_gen):
+                            out = model.generate(
+                                **{kk: v.clone() for kk, v in inputs.items()},
+                                max_new_tokens=max_new_tokens, do_sample=True, top_k=50,
+                                pad_token_id=tokenizer.pad_token_id
+                            )
+                            text = tokenizer.decode(out[0], skip_special_tokens=True)
+                            enc = reward_tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(device)
+                            with torch.no_grad():
+                                score = reward_model(**enc).logits.squeeze().float().item()
+                            all_scores.append(score)
+                    if (idx + 1) % 10 == 0:
+                        print(f"    Eval: {idx+1}/20 prompts scored")
+                return float(np.mean(all_scores)), float(np.std(all_scores))
+
+            eval_prompts = prompts[100:130]
+            print(f"  Evaluating DPO model...")
+            dpo_reward_mean, dpo_reward_std = evaluate_model(dpo_model, eval_prompts)
+            print(f"  Evaluating GGDPO model...")
+            ggdpo_reward_mean, ggdpo_reward_std = evaluate_model(ggdpo_model, eval_prompts)
+
+            run_data["dpo_reward"].append(dpo_reward_mean)
+            run_data["ggdpo_reward"].append(ggdpo_reward_mean)
+            run_data["dpo_grad_var"].append(dpo_grad_var)
+            run_data["ggdpo_grad_var"].append(ggdpo_grad_var)
+
+            del dpo_model, ggdpo_model
+            torch.cuda.empty_cache()
+
+            print(f"  Run {run_idx+1}: DPO reward={dpo_reward_mean:.3f} GGDPO reward={ggdpo_reward_mean:.3f} "
+                  f"DPO grad_var={dpo_grad_var:.4f} GGDPO grad_var={ggdpo_grad_var:.4f}")
+
+        result = {
+            "N": N, "K": K, "max_pairs": max_pairs,
+            "dpo_reward_mean": float(np.mean(run_data["dpo_reward"])),
+            "dpo_reward_std": float(np.std(run_data["dpo_reward"])),
+            "ggdpo_reward_mean": float(np.mean(run_data["ggdpo_reward"])),
+            "ggdpo_reward_std": float(np.std(run_data["ggdpo_reward"])),
+            "dpo_grad_variance_mean": float(np.mean(run_data["dpo_grad_var"])),
+            "ggdpo_grad_variance_mean": float(np.mean(run_data["ggdpo_grad_var"])),
+            "reward_improvement": float(np.mean(run_data["ggdpo_reward"]) - np.mean(run_data["dpo_reward"])),
+        }
+        results.append(result)
+        print(f"  N={N}: DPO reward={result['dpo_reward_mean']:.3f} GGDPO reward={result['ggdpo_reward_mean']:.3f} "
+              f"Improvement={result['reward_improvement']:+.3f}")
+
+    with open(os.path.join(RESULTS_DIR, "exp4_real_model.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    Ns = [r["N"] for r in results]
+    x = np.arange(len(Ns))
+    width = 0.35
+
+    dpo_rewards = [r["dpo_reward_mean"] for r in results]
+    ggdpo_rewards = [r["ggdpo_reward_mean"] for r in results]
+    dpo_rstd = [r["dpo_reward_std"] for r in results]
+    ggdpo_rstd = [r["ggdpo_reward_std"] for r in results]
+    axes[0].bar(x - width/2, dpo_rewards, width, yerr=dpo_rstd, label='DPO', capsize=4)
+    axes[0].bar(x + width/2, ggdpo_rewards, width, yerr=ggdpo_rstd, label='GGDPO', capsize=4)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(Ns)
+    axes[0].set_xlabel("N (completions)")
+    axes[0].set_ylabel("Post-Alignment Reward Score")
+    axes[0].set_title("Reward Model Score")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    dpo_gv = [r["dpo_grad_variance_mean"] for r in results]
+    ggdpo_gv = [r["ggdpo_grad_variance_mean"] for r in results]
+    axes[1].bar(x - width/2, dpo_gv, width, label='DPO', capsize=4)
+    axes[1].bar(x + width/2, ggdpo_gv, width, label='GGDPO', capsize=4)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(Ns)
+    axes[1].set_xlabel("N (completions)")
+    axes[1].set_ylabel("Gradient Norm Variance")
+    axes[1].set_title("Training Gradient Variance")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3, axis='y')
+
+    improvements = [r["reward_improvement"] for r in results]
+    bar_colors = ['green' if v > 0 else 'red' for v in improvements]
+    axes[2].bar([str(n) for n in Ns], improvements, color=bar_colors, alpha=0.7)
+    axes[2].set_xlabel("N")
+    axes[2].set_ylabel("GGDPO - DPO Reward")
+    axes[2].set_title("Reward Improvement")
+    axes[2].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp4_real_model.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+    print("\n=== Experiment 4 Complete ===")
+    print(json.dumps(results, indent=2))
+
+
+# ============================================================
+# Experiment 5: UltraFeedback Sample Efficiency
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp5_ultrafeedback():
+    """
+    UltraFeedback with ground truth from its own ratings.
+    4 completions/prompt, K in {1,2,3,6}, 3 runs per K.
+    Evaluate with both reward model AND UltraFeedback's overall_score.
+    """
+    import random
+    import json
+    import os
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+    from peft import LoraConfig, get_peft_model, TaskType
+    from datasets import load_dataset
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    h = _ggdpo_helpers()
+
+    model_name = "Qwen/Qwen3-1.7B"
+    reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-1.7B"
+
+    print("Loading models...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
+    if reward_tokenizer.pad_token is None:
+        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        reward_model_name, torch_dtype=torch.bfloat16, num_labels=1
+    ).to(device)
+    reward_model.eval()
+
+    print("Loading UltraFeedback dataset...")
+    ds = load_dataset("openbmb/UltraFeedback", split="train")
+
+    # Filter for examples with 4+ completions that have overall_score
+    # UltraFeedback schema: each completion has 'overall_score' as a direct field (float),
+    # and 'annotations' dict with per-aspect ratings (helpfulness, honesty, etc.)
+    valid_examples = []
+    for ex in ds:
+        if "completions" in ex and len(ex["completions"]) >= 4:
+            completions = ex["completions"][:4]
+            scores = []
+            valid = True
+            for c in completions:
+                if "overall_score" in c and c["overall_score"] is not None:
+                    try:
+                        scores.append(float(c["overall_score"]))
+                    except (ValueError, TypeError):
+                        valid = False
+                        break
+                else:
+                    valid = False
+                    break
+            if valid and len(scores) == 4:
+                valid_examples.append({
+                    "instruction": ex["instruction"],
+                    "completions": [c["response"] for c in completions],
+                    "scores": scores,
+                })
+        if len(valid_examples) >= 500:
+            break
+
+    print(f"Found {len(valid_examples)} valid examples with 4 completions + scores")
+
+    N = 4
+    MAX_PAIRS = N * (N - 1) // 2  # 6
+    K_values = [1, 2, 3, 6]
+    NUM_RUNS = 3
+    NUM_PROMPTS = 200
+    EPOCHS_DPO = 2
+    BATCH_SIZE = 4
+    LR = 5e-6
+
+    results = []
+
+    for K in K_values:
+        K = min(K, MAX_PAIRS)
+        print(f"\n=== K={K} oracle pairs per prompt (out of {MAX_PAIRS}) ===")
+
+        run_data = {
+            "reward_score": {"dpo": [], "ggdpo": []},
+            "uf_agreement": {"dpo": [], "ggdpo": []},
+        }
+
+        for run_idx in range(NUM_RUNS):
+            seed = 42 + run_idx + K * 100
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            examples = valid_examples[:NUM_PROMPTS]
+
+            all_dpo_pairs = []
+            all_ggdpo_pairs = []
+            uf_scores_list = []
+
+            for ex in examples:
+                instruction = ex["instruction"]
+                completions = ex["completions"]
+                uf_scores = np.array(ex["scores"])
+                uf_scores_list.append(uf_scores)
+
+                sampled_pairs = h["sample_pairs_random"](N, K)
+                labeled_pairs = h["label_pairs"](sampled_pairs, uf_scores)
+
+                bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+                ggdpo_graph = h["construct_full_graph"](bt_scores)
+
+                for w, l in labeled_pairs:
+                    all_dpo_pairs.append((instruction, completions[w], completions[l]))
+                for w, l in ggdpo_graph:
+                    all_ggdpo_pairs.append((instruction, completions[w], completions[l]))
+
+            print(f"  Run {run_idx+1}: DPO pairs={len(all_dpo_pairs)}, GGDPO pairs={len(all_ggdpo_pairs)}")
+
+            def train_and_eval(pairs, label=""):
+                ref_model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16
+                ).to(device)
+                ref_model.eval()
+                for p in ref_model.parameters():
+                    p.requires_grad = False
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16
+                ).to(device)
+                model.config.use_cache = False
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM, r=16, lora_alpha=32,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                    lora_dropout=0.0,
+                )
+                model = get_peft_model(model, lora_config)
+                model.enable_input_require_grads()
+                model.train()
+
+                optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+                total_loss = 0
+                num_batches = 0
+
+                for epoch in range(EPOCHS_DPO):
+                    random.shuffle(pairs)
+                    for start in range(0, len(pairs), BATCH_SIZE):
+                        batch = pairs[start:start + BATCH_SIZE]
+                        chosen_texts = [f"{p}\n\n{c}" for p, c, _ in batch]
+                        rejected_texts = [f"{p}\n\n{r}" for p, _, r in batch]
+
+                        chosen_enc = tokenizer(chosen_texts, return_tensors="pt", padding=True,
+                                             truncation=True, max_length=512).to(device)
+                        rejected_enc = tokenizer(rejected_texts, return_tensors="pt", padding=True,
+                                               truncation=True, max_length=512).to(device)
+
+                        optimizer.zero_grad()
+
+                        chosen_lp = h["get_log_prob_sums"](model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
+                        rejected_lp = h["get_log_prob_sums"](model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
+
+                        with torch.no_grad():
+                            ref_chosen_lp = h["get_log_prob_sums"](ref_model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
+                            ref_rejected_lp = h["get_log_prob_sums"](ref_model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
+
+                        beta = 0.1
+                        dpo_logits = beta * ((chosen_lp - ref_chosen_lp) - (rejected_lp - ref_rejected_lp))
+                        loss = -nn.functional.logsigmoid(dpo_logits).mean()
+
+                        loss.backward()
+                        optimizer.step()
+                        total_loss += loss.item()
+                        num_batches += 1
+
+                        if num_batches % 200 == 0:
+                            print(f"    {label} batch {num_batches}, loss={total_loss/num_batches:.4f}")
+
+                # Evaluate: reward scores on held-out generations
+                model.eval()
+                eval_examples = valid_examples[NUM_PROMPTS:NUM_PROMPTS + 50]
+                reward_scores = []
+                uf_agreements = 0
+                uf_total = 0
+
+                for idx, ex in enumerate(eval_examples):
+                    instruction = ex["instruction"]
+                    inputs = tokenizer(instruction, return_tensors="pt", truncation=True, max_length=256).to(device)
+                    with torch.no_grad():
+                        out = model.generate(
+                            **{kk: v.clone() for kk, v in inputs.items()},
+                            max_new_tokens=128, do_sample=True, top_k=50,
+                            pad_token_id=tokenizer.pad_token_id
+                        )
+                        text = tokenizer.decode(out[0], skip_special_tokens=True)
+                        enc = reward_tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(device)
+                        score = reward_model(**enc).logits.squeeze().float().item()
+                        reward_scores.append(score)
+
+                    # UltraFeedback agreement: check if model's logprobs agree with UF scores
+                    completions = ex["completions"]
+                    uf_scores = np.array(ex["scores"])
+                    comp_encs = tokenizer(completions, return_tensors="pt", padding=True,
+                                        truncation=True, max_length=256).to(device)
+                    with torch.no_grad():
+                        model_lps = h["get_log_prob_sums"](model, comp_encs["input_ids"],
+                                                           comp_encs["attention_mask"])
+                        model_lps_np = model_lps.float().cpu().numpy()
+
+                    agree, total = h["count_pair_agreements"](model_lps_np, uf_scores)
+                    uf_agreements += agree
+                    uf_total += total
+
+                del ref_model, model
+                torch.cuda.empty_cache()
+
+                return float(np.mean(reward_scores)), uf_agreements / max(uf_total, 1)
+
+            print(f"  Training & evaluating DPO...")
+            dpo_reward, dpo_uf_agree = train_and_eval(all_dpo_pairs, "DPO")
+            print(f"  Training & evaluating GGDPO...")
+            ggdpo_reward, ggdpo_uf_agree = train_and_eval(all_ggdpo_pairs, "GGDPO")
+
+            run_data["reward_score"]["dpo"].append(dpo_reward)
+            run_data["reward_score"]["ggdpo"].append(ggdpo_reward)
+            run_data["uf_agreement"]["dpo"].append(dpo_uf_agree)
+            run_data["uf_agreement"]["ggdpo"].append(ggdpo_uf_agree)
+
+            print(f"  Run {run_idx+1}: DPO reward={dpo_reward:.3f} GGDPO reward={ggdpo_reward:.3f} "
+                  f"DPO UF agree={dpo_uf_agree:.3f} GGDPO UF agree={ggdpo_uf_agree:.3f}")
+
+        result = {
+            "K": K, "N": N, "max_pairs": MAX_PAIRS,
+            "dpo_reward_mean": float(np.mean(run_data["reward_score"]["dpo"])),
+            "dpo_reward_std": float(np.std(run_data["reward_score"]["dpo"])),
+            "ggdpo_reward_mean": float(np.mean(run_data["reward_score"]["ggdpo"])),
+            "ggdpo_reward_std": float(np.std(run_data["reward_score"]["ggdpo"])),
+            "dpo_uf_agreement_mean": float(np.mean(run_data["uf_agreement"]["dpo"])),
+            "dpo_uf_agreement_std": float(np.std(run_data["uf_agreement"]["dpo"])),
+            "ggdpo_uf_agreement_mean": float(np.mean(run_data["uf_agreement"]["ggdpo"])),
+            "ggdpo_uf_agreement_std": float(np.std(run_data["uf_agreement"]["ggdpo"])),
+            "reward_improvement": float(np.mean(run_data["reward_score"]["ggdpo"]) - np.mean(run_data["reward_score"]["dpo"])),
+            "uf_agreement_improvement": float(np.mean(run_data["uf_agreement"]["ggdpo"]) - np.mean(run_data["uf_agreement"]["dpo"])),
+        }
+        results.append(result)
+        print(f"  K={K}: DPO reward={result['dpo_reward_mean']:.3f}+-{result['dpo_reward_std']:.3f} "
+              f"GGDPO reward={result['ggdpo_reward_mean']:.3f}+-{result['ggdpo_reward_std']:.3f}")
+
+    with open(os.path.join(RESULTS_DIR, "exp5_ultrafeedback.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    Ks = [r["K"] for r in results]
+
+    dpo_r = [r["dpo_reward_mean"] for r in results]
+    dpo_rs = [r["dpo_reward_std"] for r in results]
+    ggdpo_r = [r["ggdpo_reward_mean"] for r in results]
+    ggdpo_rs = [r["ggdpo_reward_std"] for r in results]
+    ax1.errorbar(Ks, dpo_r, yerr=dpo_rs, marker='o', capsize=4, label='DPO')
+    ax1.errorbar(Ks, ggdpo_r, yerr=ggdpo_rs, marker='x', capsize=4, label='GGDPO')
+    ax1.set_xlabel("K (oracle pairs per prompt)")
+    ax1.set_ylabel("Reward Model Score")
+    ax1.set_title("UltraFeedback: Reward Score vs Oracle Budget")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    dpo_uf = [r["dpo_uf_agreement_mean"] for r in results]
+    dpo_ufs = [r["dpo_uf_agreement_std"] for r in results]
+    ggdpo_uf = [r["ggdpo_uf_agreement_mean"] for r in results]
+    ggdpo_ufs = [r["ggdpo_uf_agreement_std"] for r in results]
+    ax2.errorbar(Ks, dpo_uf, yerr=dpo_ufs, marker='o', capsize=4, label='DPO')
+    ax2.errorbar(Ks, ggdpo_uf, yerr=ggdpo_ufs, marker='x', capsize=4, label='GGDPO')
+    ax2.set_xlabel("K (oracle pairs per prompt)")
+    ax2.set_ylabel("UltraFeedback Agreement")
+    ax2.set_title("UltraFeedback: Agreement with Human Ratings")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp5_ultrafeedback.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+    print("\n=== Experiment 5 Complete ===")
+    print(json.dumps(results, indent=2))
+
+
+# ============================================================
+# Experiment 6: Gradient Variance Reduction (Direct Measurement)
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp6_gradient_variance():
+    """
+    Directly measure gradient variance for DPO vs GGDPO.
+    GPT-2, N=20, K=20. Compute DPO loss gradient for multiple mini-batches.
+    Measure variance of gradient norm across batches + cosine similarity to full-data gradient.
+    """
+    import copy
+    import random
+    import string
+    import json
+    import os
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    h = _ggdpo_helpers()
+    BASE_SEED = 42
+
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    N = 20
+    K = 20
+    MAX_PAIRS = N * (N - 1) // 2  # 190
+    NUM_RUNS = 20
+    MINI_BATCH_SIZE = 10
+
+    results = {"dpo": [], "ggdpo": []}
 
     for run_idx in range(NUM_RUNS):
         seed = BASE_SEED + run_idx
@@ -791,84 +1476,17 @@ def exp3_ablations():
         pi_ref.config.use_cache = False
         pi_ref.eval()
 
-        perm = np.random.permutation(N)
-        oracle_scores = np.empty(N)
-        for rank, idx in enumerate(perm):
-            oracle_scores[idx] = rank + 1
-
-        sampled_pairs = h["sample_pairs_random"](N, K)
-        labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
-
-        # Generate completions
-        completions = []
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        completions = []
         with torch.no_grad():
             for _ in range(N):
                 out = pi_ref.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
+                    **{kk: v.clone() for kk, v in inputs.items()},
                     max_length=20, do_sample=True, top_k=50,
                     pad_token_id=tokenizer.eos_token_id
                 )
                 completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
 
-        tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
-        ids = tokens["input_ids"].to(device)
-        mask = tokens["attention_mask"].to(device)
-        with torch.no_grad():
-            ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
-
-        # DPO baseline
-        pi_dpo = copy.deepcopy(pi_ref).train()
-        dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs, epochs=EPOCHS, device=device)
-        dpo_m = h["compute_ranking_metrics"](np.array(dpo_lps[-1]), oracle_scores)
-        method_results["dpo_baseline"]["agreement"].append(dpo_m["pairwise_agreement"])
-        method_results["dpo_baseline"]["kendall"].append(dpo_m["kendall_tau"])
-        del pi_dpo
-        torch.cuda.empty_cache()
-
-        # Each graph estimation method
-        for name, fit_fn in methods.items():
-            est_scores = fit_fn(N, labeled_pairs)
-            full_graph = h["construct_full_graph"](est_scores)
-
-            pi_method = copy.deepcopy(pi_ref).train()
-            lps = h["train_dpo"](pi_method, ref_lp, ids, mask, full_graph, epochs=EPOCHS, device=device)
-            m = h["compute_ranking_metrics"](np.array(lps[-1]), oracle_scores)
-            method_results[name]["agreement"].append(m["pairwise_agreement"])
-            method_results[name]["kendall"].append(m["kendall_tau"])
-            del pi_method
-            torch.cuda.empty_cache()
-
-        del pi_ref
-        torch.cuda.empty_cache()
-        print(f"  Run {run_idx+1}/{NUM_RUNS}: " + " ".join(
-            f"{name}={np.mean(method_results[name]['agreement']):.3f}" for name in method_results
-        ))
-
-    ablation1_results = {
-        name: {
-            "agreement_mean": float(np.mean(data["agreement"])),
-            "agreement_std": float(np.std(data["agreement"])),
-            "kendall_mean": float(np.mean(data["kendall"])),
-        }
-        for name, data in method_results.items()
-    }
-
-    # Ablation 2: Confidence-weighted DPO
-    print("\n=== Ablation 2: Confidence-Weighted DPO ===")
-    weight_results = {"unweighted": {"agreement": []}, "confidence_weighted": {"agreement": []}}
-
-    for run_idx in range(NUM_RUNS):
-        seed = BASE_SEED + run_idx + 5000
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-
-        prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
-        pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
-        pi_ref.config.use_cache = False
-        pi_ref.eval()
-
         perm = np.random.permutation(N)
         oracle_scores = np.empty(N)
         for rank, idx in enumerate(perm):
@@ -876,734 +1494,531 @@ def exp3_ablations():
 
         sampled_pairs = h["sample_pairs_random"](N, K)
         labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+
         bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
-
-        completions = []
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            for _ in range(N):
-                out = pi_ref.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
-                    max_length=20, do_sample=True, top_k=50,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-                completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+        ggdpo_graph = h["construct_full_graph"](bt_scores)
 
         tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
         ids = tokens["input_ids"].to(device)
         mask = tokens["attention_mask"].to(device)
+
         with torch.no_grad():
             ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
 
-        # Unweighted
-        full_graph = h["construct_full_graph"](bt_scores)
-        pi_uw = copy.deepcopy(pi_ref).train()
-        uw_lps = h["train_dpo"](pi_uw, ref_lp, ids, mask, full_graph, epochs=EPOCHS, device=device)
-        uw_m = h["compute_ranking_metrics"](np.array(uw_lps[-1]), oracle_scores)
-        weight_results["unweighted"]["agreement"].append(uw_m["pairwise_agreement"])
-        del pi_uw
-        torch.cuda.empty_cache()
+        def compute_gradient_stats(model, pairs, label):
+            """Compute gradient norms for mini-batches and full batch."""
+            model = copy.deepcopy(model).train()
+            winners = torch.tensor([w for w, _ in pairs], dtype=torch.long, device=device)
+            losers = torch.tensor([l for _, l in pairs], dtype=torch.long, device=device)
+            beta = 0.1
 
-        # Confidence-weighted
-        weighted_graph, weights = h["construct_weighted_graph"](bt_scores)
-        pi_cw = copy.deepcopy(pi_ref).train()
-        cw_lps = h["train_dpo"](pi_cw, ref_lp, ids, mask, weighted_graph, epochs=EPOCHS,
-                                weights=weights, device=device)
-        cw_m = h["compute_ranking_metrics"](np.array(cw_lps[-1]), oracle_scores)
-        weight_results["confidence_weighted"]["agreement"].append(cw_m["pairwise_agreement"])
-        del pi_cw, pi_ref
-        torch.cuda.empty_cache()
+            # Full-batch gradient
+            model.zero_grad()
+            policy_log_probs = h["get_log_prob_sums"](model, ids, mask)
+            policy_w = policy_log_probs[winners]
+            policy_l = policy_log_probs[losers]
+            ref_w = ref_lp[winners]
+            ref_l = ref_lp[losers]
+            dpo_logits = beta * ((policy_w - ref_w) - (policy_l - ref_l))
+            loss = -nn.functional.logsigmoid(dpo_logits).mean()
+            loss.backward()
 
-        print(f"  Run {run_idx+1}: UW={uw_m['pairwise_agreement']:.3f} CW={cw_m['pairwise_agreement']:.3f}")
+            full_grad = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    full_grad.append(p.grad.data.clone().flatten())
+            full_grad = torch.cat(full_grad)
+            full_grad_norm = full_grad.norm().item()
 
-    ablation2_results = {
-        name: {"agreement_mean": float(np.mean(data["agreement"])),
-               "agreement_std": float(np.std(data["agreement"]))}
-        for name, data in weight_results.items()
-    }
+            # Mini-batch gradients
+            n_pairs = len(pairs)
+            indices = list(range(n_pairs))
+            batch_grad_norms = []
+            batch_cosine_sims = []
 
-    # Ablation 3: Graph sampling structure
-    print("\n=== Ablation 3: Graph Sampling Structure ===")
-    sampling_fns = {
-        "random": h["sample_pairs_random"],
-        "chain": h["sample_pairs_chain"],
-        "star": h["sample_pairs_star"],
-    }
-    structure_results = {name: {"agreement": [], "bt_acc": []} for name in sampling_fns}
+            for mb_start in range(0, n_pairs, MINI_BATCH_SIZE):
+                mb_end = min(mb_start + MINI_BATCH_SIZE, n_pairs)
+                mb_winners = winners[mb_start:mb_end]
+                mb_losers = losers[mb_start:mb_end]
 
-    for run_idx in range(NUM_RUNS):
-        seed = BASE_SEED + run_idx + 9000
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+                model.zero_grad()
+                policy_log_probs = h["get_log_prob_sums"](model, ids, mask)
+                pw = policy_log_probs[mb_winners]
+                pl = policy_log_probs[mb_losers]
+                rw = ref_lp[mb_winners]
+                rl = ref_lp[mb_losers]
+                logits = beta * ((pw - rw) - (pl - rl))
+                mb_loss = -nn.functional.logsigmoid(logits).mean()
+                mb_loss.backward()
 
-        prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
-        pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
-        pi_ref.config.use_cache = False
-        pi_ref.eval()
+                mb_grad = []
+                for p in model.parameters():
+                    if p.grad is not None:
+                        mb_grad.append(p.grad.data.clone().flatten())
+                mb_grad = torch.cat(mb_grad)
 
-        perm = np.random.permutation(N)
-        oracle_scores = np.empty(N)
-        for rank, idx in enumerate(perm):
-            oracle_scores[idx] = rank + 1
+                batch_grad_norms.append(mb_grad.norm().item())
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    mb_grad.unsqueeze(0), full_grad.unsqueeze(0)
+                ).item()
+                batch_cosine_sims.append(cos_sim)
 
-        completions = []
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            for _ in range(N):
-                out = pi_ref.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
-                    max_length=20, do_sample=True, top_k=50,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-                completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+            del model
+            return {
+                "full_grad_norm": full_grad_norm,
+                "batch_grad_norms": batch_grad_norms,
+                "grad_norm_variance": float(np.var(batch_grad_norms)),
+                "grad_norm_mean": float(np.mean(batch_grad_norms)),
+                "cosine_sim_mean": float(np.mean(batch_cosine_sims)),
+                "cosine_sim_std": float(np.std(batch_cosine_sims)),
+            }
 
-        tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
-        ids = tokens["input_ids"].to(device)
-        mask = tokens["attention_mask"].to(device)
-        with torch.no_grad():
-            ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
+        dpo_stats = compute_gradient_stats(pi_ref, labeled_pairs, "DPO")
+        ggdpo_stats = compute_gradient_stats(pi_ref, ggdpo_graph, "GGDPO")
 
-        for name, sample_fn in sampling_fns.items():
-            # Use same seed offset for fair comparison
-            np.random.seed(seed + hash(name) % 10000)
-            sampled = sample_fn(N, K)
-            labeled = h["label_pairs"](sampled, oracle_scores)
-            bt_scores = h["fit_bradley_terry"](N, labeled)
-            bt_agree, bt_total = h["count_pair_agreements"](bt_scores, oracle_scores)
-            structure_results[name]["bt_acc"].append(bt_agree / bt_total)
-
-            full_graph = h["construct_full_graph"](bt_scores)
-            pi_m = copy.deepcopy(pi_ref).train()
-            lps = h["train_dpo"](pi_m, ref_lp, ids, mask, full_graph, epochs=EPOCHS, device=device)
-            m = h["compute_ranking_metrics"](np.array(lps[-1]), oracle_scores)
-            structure_results[name]["agreement"].append(m["pairwise_agreement"])
-            del pi_m
-            torch.cuda.empty_cache()
+        results["dpo"].append(dpo_stats)
+        results["ggdpo"].append(ggdpo_stats)
 
         del pi_ref
         torch.cuda.empty_cache()
-        print(f"  Run {run_idx+1}: " + " ".join(
-            f"{name}={np.mean(structure_results[name]['agreement']):.3f}" for name in sampling_fns
-        ))
 
-    ablation3_results = {
-        name: {
-            "agreement_mean": float(np.mean(data["agreement"])),
-            "agreement_std": float(np.std(data["agreement"])),
-            "bt_accuracy_mean": float(np.mean(data["bt_acc"])),
-        }
-        for name, data in structure_results.items()
+        if (run_idx + 1) % 5 == 0:
+            print(f"Run {run_idx+1}/{NUM_RUNS}: DPO grad_var={dpo_stats['grad_norm_variance']:.6f} "
+                  f"GGDPO grad_var={ggdpo_stats['grad_norm_variance']:.6f} "
+                  f"DPO cos_sim={dpo_stats['cosine_sim_mean']:.3f} "
+                  f"GGDPO cos_sim={ggdpo_stats['cosine_sim_mean']:.3f}")
+
+    # Aggregate results
+    summary = {
+        "N": N, "K": K, "max_pairs": MAX_PAIRS, "num_runs": NUM_RUNS,
+        "dpo_grad_norm_variance_mean": float(np.mean([r["grad_norm_variance"] for r in results["dpo"]])),
+        "dpo_grad_norm_variance_std": float(np.std([r["grad_norm_variance"] for r in results["dpo"]])),
+        "ggdpo_grad_norm_variance_mean": float(np.mean([r["grad_norm_variance"] for r in results["ggdpo"]])),
+        "ggdpo_grad_norm_variance_std": float(np.std([r["grad_norm_variance"] for r in results["ggdpo"]])),
+        "dpo_cosine_sim_mean": float(np.mean([r["cosine_sim_mean"] for r in results["dpo"]])),
+        "ggdpo_cosine_sim_mean": float(np.mean([r["cosine_sim_mean"] for r in results["ggdpo"]])),
+        "variance_reduction_ratio": float(
+            np.mean([r["grad_norm_variance"] for r in results["dpo"]]) /
+            max(np.mean([r["grad_norm_variance"] for r in results["ggdpo"]]), 1e-12)
+        ),
     }
 
-    # Save all ablation results
-    all_ablations = {
-        "graph_estimation_methods": ablation1_results,
-        "confidence_weighting": ablation2_results,
-        "graph_sampling_structure": ablation3_results,
-    }
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(f"{RESULTS_DIR}/exp3_ablations.json", "w") as f:
-        json.dump(all_ablations, f, indent=2)
+    with open(os.path.join(RESULTS_DIR, "exp6_gradient_variance.json"), "w") as f:
+        json.dump({"summary": summary, "raw": {
+            "dpo": [{k: v for k, v in r.items() if k != "batch_grad_norms"} for r in results["dpo"]],
+            "ggdpo": [{k: v for k, v in r.items() if k != "batch_grad_norms"} for r in results["ggdpo"]],
+        }}, f, indent=2)
 
-    # Plot ablation 1
-    fig, ax = plt.subplots(figsize=(8, 5))
-    names = list(ablation1_results.keys())
-    means = [ablation1_results[n]["agreement_mean"] for n in names]
-    stds = [ablation1_results[n]["agreement_std"] for n in names]
-    bars = ax.bar(names, means, yerr=stds, capsize=5, color=["tab:gray", "tab:blue", "tab:green", "tab:red"])
-    ax.set_ylabel("Pairwise Agreement")
-    ax.set_title("Graph Estimation Methods (N=30, K=30)")
-    ax.grid(True, alpha=0.3, axis="y")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    dpo_vars = [r["grad_norm_variance"] for r in results["dpo"]]
+    ggdpo_vars = [r["grad_norm_variance"] for r in results["ggdpo"]]
+    ax1.boxplot([dpo_vars, ggdpo_vars], labels=["DPO", "GGDPO"])
+    ax1.set_ylabel("Gradient Norm Variance")
+    ax1.set_title(f"Gradient Variance (N={N}, K={K})")
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    dpo_cos = [r["cosine_sim_mean"] for r in results["dpo"]]
+    ggdpo_cos = [r["cosine_sim_mean"] for r in results["ggdpo"]]
+    ax2.boxplot([dpo_cos, ggdpo_cos], labels=["DPO", "GGDPO"])
+    ax2.set_ylabel("Cosine Similarity to Full Gradient")
+    ax2.set_title(f"Gradient Direction Consistency (N={N}, K={K})")
+    ax2.grid(True, alpha=0.3, axis='y')
+
     plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp3_graph_methods.png", dpi=150)
+    plt.savefig(os.path.join(RESULTS_DIR, "exp6_gradient_variance.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     results_vol.commit()
-    print("\n=== Experiment 3 (Ablations) Complete ===")
-    print(json.dumps(all_ablations, indent=2))
-    return all_ablations
+    print("\n=== Experiment 6 Complete ===")
+    print(json.dumps(summary, indent=2))
 
 
 # ============================================================
-# Experiment 4: Qwen3-1.7B + Reward Model (Scaled Up)
+# Experiment 7: Noisy Oracle Denoising
 # ============================================================
 
 @app.function(**COMMON_KWARGS)
-def exp4_reward_model_scaled():
+def exp7_noisy_oracle():
     """
-    Scaled-up reward model experiment with Qwen3-1.7B.
-    Tests N={15,30,50} with reward model oracle.
+    Show GGDPO's BT fitting acts as built-in denoiser for noisy preferences.
+    GPT-2, N=15, noise levels p in {0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3}.
+    K=2N=30 noisy oracle pairs.
+    Compare DPO on K noisy pairs vs GGDPO on BT-expanded pairs from K noisy pairs.
+    Metric: agreement with TRUE noiseless ranking.
     """
     import copy
     import random
+    import string
     import json
     import os
     import numpy as np
     import torch
-    import torch.nn as nn
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-    device = "cuda"
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    h = _ggdpo_helpers()
-    BASE_SEED = 44
-
-    policy_model_name = "Qwen/Qwen3-1.7B"
-    reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-1.7B"
-
-    tokenizer = AutoTokenizer.from_pretrained(policy_model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        reward_model_name, torch_dtype=torch.bfloat16
-    ).to(device).eval()
-
-    topics = [
-        "democracy", "technology", "education", "climate", "healthcare",
-        "economics", "ethics", "artificial intelligence", "privacy", "globalization",
-    ]
-
-    N_values = [15, 30, 50]
-    EPOCHS = 50
-    MAX_NEW_TOKENS = 256
-
-    def generate_completions(model, prompt, n, max_new_tokens=256):
-        model.eval()
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        completions = []
-        with torch.no_grad():
-            for _ in range(n):
-                out = model.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
-                    max_new_tokens=max_new_tokens, do_sample=True, top_k=50,
-                    pad_token_id=tokenizer.pad_token_id
-                )
-                text = tokenizer.decode(out[0], skip_special_tokens=True)
-                if text.startswith(prompt):
-                    text = text[len(prompt):]
-                completions.append(text)
-        return completions
-
-    def get_reward_scores(prompt, completions, batch_size=4):
-        scores = []
-        for i in range(0, len(completions), batch_size):
-            batch = completions[i:i + batch_size]
-            texts = [f"{prompt}\n\n{c}" for c in batch]
-            inputs = tokenizer(texts, return_tensors="pt", padding=True,
-                             truncation=True, max_length=512).to(device)
-            with torch.no_grad():
-                outputs = reward_model(**inputs)
-                batch_scores = outputs.logits.squeeze(-1).float().cpu().numpy()
-                scores.extend(batch_scores.tolist())
-        return np.array(scores)
-
-    all_results = []
-
-    for N in N_values:
-        K = N
-        NUM_RUNS = min(len(topics), 10)
-
-        print(f"\n=== N={N}, K={K} ===")
-        run_data = {"dpo": [], "ggdpo": [], "bt_acc": [],
-                    "dpo_reward": [], "ggdpo_reward": []}
-
-        for run_idx in range(NUM_RUNS):
-            seed = BASE_SEED + run_idx
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            random.seed(seed)
-
-            topic = topics[run_idx]
-            prompt = f"Write a detailed, well-structured essay about {topic}."
-            print(f"  Run {run_idx+1}: topic='{topic}'")
-
-            pi_ref = AutoModelForCausalLM.from_pretrained(
-                policy_model_name, torch_dtype=torch.bfloat16
-            ).to(device)
-            pi_ref.config.use_cache = False
-            pi_ref.eval()
-
-            pi_dpo = copy.deepcopy(pi_ref).train()
-            pi_ggdpo = copy.deepcopy(pi_ref).train()
-
-            completions = generate_completions(pi_ref, prompt, N, MAX_NEW_TOKENS)
-            oracle_scores = get_reward_scores(prompt, completions)
-
-            sampled_pairs = h["sample_pairs_random"](N, K)
-            labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
-
-            bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
-            bt_agree, bt_total = h["count_pair_agreements"](bt_scores, oracle_scores)
-            run_data["bt_acc"].append(bt_agree / bt_total)
-
-            full_graph = h["construct_full_graph"](bt_scores)
-
-            tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
-            ids = tokens["input_ids"].to(device)
-            mask = tokens["attention_mask"].to(device)
-            with torch.no_grad():
-                ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
-
-            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, labeled_pairs,
-                                     epochs=EPOCHS, lr=1e-5, beta=0.1, device=device,
-                                     model_is_bf16=True)
-            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, full_graph,
-                                       epochs=EPOCHS, lr=1e-5, beta=0.1, device=device,
-                                       model_is_bf16=True)
-
-            dpo_m = h["compute_ranking_metrics"](np.array(dpo_lps[-1]), oracle_scores)
-            ggdpo_m = h["compute_ranking_metrics"](np.array(ggdpo_lps[-1]), oracle_scores)
-            run_data["dpo"].append(dpo_m["pairwise_agreement"])
-            run_data["ggdpo"].append(ggdpo_m["pairwise_agreement"])
-
-            # Evaluate: generate new completions and score them
-            dpo_eval = generate_completions(pi_dpo, prompt, 10, MAX_NEW_TOKENS)
-            ggdpo_eval = generate_completions(pi_ggdpo, prompt, 10, MAX_NEW_TOKENS)
-            dpo_eval_scores = get_reward_scores(prompt, dpo_eval)
-            ggdpo_eval_scores = get_reward_scores(prompt, ggdpo_eval)
-            run_data["dpo_reward"].append(float(np.mean(dpo_eval_scores)))
-            run_data["ggdpo_reward"].append(float(np.mean(ggdpo_eval_scores)))
-
-            del pi_ref, pi_dpo, pi_ggdpo
-            torch.cuda.empty_cache()
-
-            print(f"    DPO={dpo_m['pairwise_agreement']:.3f} GGDPO={ggdpo_m['pairwise_agreement']:.3f} "
-                  f"DPO_reward={np.mean(dpo_eval_scores):.3f} GGDPO_reward={np.mean(ggdpo_eval_scores):.3f}")
-
-        result = {
-            "N": N, "K": K,
-            "dpo_agreement_mean": float(np.mean(run_data["dpo"])),
-            "dpo_agreement_std": float(np.std(run_data["dpo"])),
-            "ggdpo_agreement_mean": float(np.mean(run_data["ggdpo"])),
-            "ggdpo_agreement_std": float(np.std(run_data["ggdpo"])),
-            "bt_accuracy_mean": float(np.mean(run_data["bt_acc"])),
-            "dpo_reward_mean": float(np.mean(run_data["dpo_reward"])),
-            "dpo_reward_std": float(np.std(run_data["dpo_reward"])),
-            "ggdpo_reward_mean": float(np.mean(run_data["ggdpo_reward"])),
-            "ggdpo_reward_std": float(np.std(run_data["ggdpo_reward"])),
-        }
-        all_results.append(result)
-        print(f"  Avg: DPO_agree={result['dpo_agreement_mean']:.3f} GGDPO_agree={result['ggdpo_agreement_mean']:.3f}")
-        print(f"  Avg: DPO_reward={result['dpo_reward_mean']:.3f} GGDPO_reward={result['ggdpo_reward_mean']:.3f}")
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(f"{RESULTS_DIR}/exp4_reward_model_scaled.json", "w") as f:
-        json.dump(all_results, f, indent=2)
-
-    # Plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    ns = [r["N"] for r in all_results]
-    ax1.bar([x - 0.2 for x in range(len(ns))], [r["dpo_agreement_mean"] for r in all_results],
-            0.4, label="DPO", yerr=[r["dpo_agreement_std"] for r in all_results], capsize=3)
-    ax1.bar([x + 0.2 for x in range(len(ns))], [r["ggdpo_agreement_mean"] for r in all_results],
-            0.4, label="GGDPO", yerr=[r["ggdpo_agreement_std"] for r in all_results], capsize=3)
-    ax1.set_xticks(range(len(ns)))
-    ax1.set_xticklabels([str(n) for n in ns])
-    ax1.set_xlabel("N (completions)")
-    ax1.set_ylabel("Oracle Agreement")
-    ax1.set_title("Reward Model Agreement")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3, axis="y")
-
-    ax2.bar([x - 0.2 for x in range(len(ns))], [r["dpo_reward_mean"] for r in all_results],
-            0.4, label="DPO", yerr=[r["dpo_reward_std"] for r in all_results], capsize=3)
-    ax2.bar([x + 0.2 for x in range(len(ns))], [r["ggdpo_reward_mean"] for r in all_results],
-            0.4, label="GGDPO", yerr=[r["ggdpo_reward_std"] for r in all_results], capsize=3)
-    ax2.set_xticks(range(len(ns)))
-    ax2.set_xticklabels([str(n) for n in ns])
-    ax2.set_xlabel("N (completions)")
-    ax2.set_ylabel("Post-Alignment Reward Score")
-    ax2.set_title("Post-Alignment Quality")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp4_reward_model_scaled.png", dpi=150)
-    plt.close()
-
-    results_vol.commit()
-    print("\n=== Experiment 4 (Reward Model Scaled) Complete ===")
-    return all_results
-
-
-# ============================================================
-# Experiment 5: UltraFeedback Benchmark
-# ============================================================
-
-@app.function(**COMMON_KWARGS)
-def exp5_ultrafeedback():
-    """
-    UltraFeedback benchmark: subsample pairs, GGDPO expands to full graph.
-    Uses Qwen3-1.7B with DPO training on real preference data.
-    Evaluates sample efficiency frontier.
-    """
-    import json
-    import os
-    import random
-    import numpy as np
-    import torch
-    import torch.nn as nn
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
-    from peft import get_peft_model, LoraConfig, TaskType
-
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
     h = _ggdpo_helpers()
     BASE_SEED = 42
 
-    model_name = "Qwen/Qwen3-1.7B"
-    reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-1.7B"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
-    if reward_tokenizer.pad_token is None:
-        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+    N = 15
+    K = 2 * N  # 30
+    MAX_PAIRS = N * (N - 1) // 2  # 105
+    noise_levels = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+    NUM_RUNS = 20
+    EPOCHS = 200
 
-    print("Loading UltraFeedback dataset...")
-    ds = load_dataset("openbmb/UltraFeedback", split="train")
-    print(f"Loaded {len(ds)} examples")
-
-    # Filter to examples with >= 4 completions that have overall_score
-    valid_examples = []
-    for ex in ds:
-        completions = ex.get("completions", [])
-        if len(completions) >= 4:
-            rated = []
-            for c in completions[:4]:
-                # overall_score is a direct field on each completion (float)
-                rating = c.get("overall_score", None)
-                if rating is not None:
-                    try:
-                        rating = float(rating)
-                    except (ValueError, TypeError):
-                        rating = None
-                if rating is not None:
-                    rated.append({"response": c["response"], "rating": rating})
-            if len(rated) >= 4:
-                valid_examples.append({
-                    "instruction": ex["instruction"],
-                    "completions": rated[:4],
-                })
-        if len(valid_examples) >= 2000:
-            break
-
-    print(f"Valid examples with 4+ rated completions: {len(valid_examples)}")
-
-    # Split: 500 train, 200 eval (balanced for compute budget)
-    random.seed(BASE_SEED)
-    random.shuffle(valid_examples)
-    train_examples = valid_examples[:500]
-    eval_examples = valid_examples[500:700]
-    print(f"Train: {len(train_examples)}, Eval: {len(eval_examples)}")
-
-    def build_dpo_pairs(examples, k_pairs_per_prompt):
-        """Build DPO training pairs. Returns list of (prompt, chosen, rejected)."""
-        pairs = []
-        for ex in examples:
-            n = len(ex["completions"])
-            ratings = [c["rating"] for c in ex["completions"]]
-            # All possible pairs
-            all_pairs_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
-            # Sample k pairs
-            k = min(k_pairs_per_prompt, len(all_pairs_idx))
-            sampled = random.sample(all_pairs_idx, k)
-            labeled = h["label_pairs"](sampled, ratings)
-            for w, l in labeled:
-                pairs.append((ex["instruction"], ex["completions"][w]["response"],
-                             ex["completions"][l]["response"]))
-        return pairs
-
-    def build_ggdpo_pairs(examples, k_pairs_per_prompt):
-        """Build GGDPO training pairs: sample k, fit BT, expand to full graph."""
-        pairs = []
-        for ex in examples:
-            n = len(ex["completions"])
-            ratings = [c["rating"] for c in ex["completions"]]
-            all_pairs_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
-            k = min(k_pairs_per_prompt, len(all_pairs_idx))
-            sampled = random.sample(all_pairs_idx, k)
-            labeled = h["label_pairs"](sampled, ratings)
-            # Fit BT from sampled pairs
-            bt_scores = h["fit_bradley_terry"](n, labeled, n_iters=500)
-            # Expand to full graph
-            full_graph = h["construct_full_graph"](bt_scores)
-            for w, l in full_graph:
-                pairs.append((ex["instruction"], ex["completions"][w]["response"],
-                             ex["completions"][l]["response"]))
-        return pairs
-
-    def build_full_dpo_pairs(examples):
-        """Build DPO pairs using ALL available pairs (upper bound)."""
-        pairs = []
-        for ex in examples:
-            n = len(ex["completions"])
-            ratings = [c["rating"] for c in ex["completions"]]
-            all_pairs_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
-            labeled = h["label_pairs"](all_pairs_idx, ratings)
-            for w, l in labeled:
-                pairs.append((ex["instruction"], ex["completions"][w]["response"],
-                             ex["completions"][l]["response"]))
-        return pairs
-
-    def train_dpo_on_pairs(model_name, dpo_pairs, num_epochs=3, batch_size=4, lr=5e-6, max_length=512):
-        """Train a model with LoRA DPO on the given pairs."""
-        if len(dpo_pairs) == 0:
-            print("    WARNING: No DPO pairs to train on!")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=torch.bfloat16
-            ).to(device)
-            return model, 0.0
-
-        # Load frozen reference model
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
-        ).to(device)
-        ref_model.eval()
-        for p in ref_model.parameters():
-            p.requires_grad = False
-
-        # Load policy model with LoRA
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
-        ).to(device)
-        model.config.use_cache = False
-
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=16, lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            lora_dropout=0.0,
-        )
-        model = get_peft_model(model, lora_config)
-        model.enable_input_require_grads()
-        model.train()
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-        total_loss = 0
-        num_batches = 0
-
-        for epoch in range(num_epochs):
-            random.shuffle(dpo_pairs)
-            for start in range(0, len(dpo_pairs), batch_size):
-                batch = dpo_pairs[start:start + batch_size]
-
-                chosen_texts = [f"{p}\n\n{c}" for p, c, _ in batch]
-                rejected_texts = [f"{p}\n\n{r}" for p, _, r in batch]
-
-                chosen_enc = tokenizer(chosen_texts, return_tensors="pt", padding=True,
-                                     truncation=True, max_length=max_length).to(device)
-                rejected_enc = tokenizer(rejected_texts, return_tensors="pt", padding=True,
-                                       truncation=True, max_length=max_length).to(device)
-
-                optimizer.zero_grad()
-
-                # Policy log probs
-                chosen_lp = h["get_log_prob_sums"](model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
-                rejected_lp = h["get_log_prob_sums"](model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
-
-                # Reference log probs from frozen reference model
-                with torch.no_grad():
-                    ref_chosen_lp = h["get_log_prob_sums"](ref_model, chosen_enc["input_ids"], chosen_enc["attention_mask"])
-                    ref_rejected_lp = h["get_log_prob_sums"](ref_model, rejected_enc["input_ids"], rejected_enc["attention_mask"])
-
-                beta = 0.1
-                logits = beta * ((chosen_lp - ref_chosen_lp) - (rejected_lp - ref_rejected_lp))
-                loss = -nn.functional.logsigmoid(logits).mean()
-
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-                num_batches += 1
-
-                if num_batches % 100 == 0:
-                    print(f"    Epoch {epoch+1}/{num_epochs}, Batch {num_batches}, loss={total_loss/num_batches:.4f}")
-
-        del ref_model
-        torch.cuda.empty_cache()
-
-        avg_loss = total_loss / max(num_batches, 1)
-        return model, avg_loss
-
-    def evaluate_with_reward_model(model, eval_examples, reward_model, n_gen=2, max_new_tokens=128):
-        """Generate completions and score with reward model."""
-        model.eval()
-        all_scores = []
-
-        for idx, ex in enumerate(eval_examples[:50]):  # Evaluate on 50 examples
-            prompt = ex["instruction"]
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
-
-            completions = []
-            with torch.no_grad():
-                for _ in range(n_gen):
-                    out = model.generate(
-                        **{k: v.clone() for k, v in inputs.items()},
-                        max_new_tokens=max_new_tokens, do_sample=True, top_k=50,
-                        pad_token_id=tokenizer.pad_token_id
-                    )
-                    text = tokenizer.decode(out[0], skip_special_tokens=True)
-                    completions.append(text)
-
-            # Score using reward model tokenizer
-            for comp in completions:
-                enc = reward_tokenizer(comp, return_tensors="pt", truncation=True, max_length=512).to(device)
-                with torch.no_grad():
-                    score = reward_model(**enc).logits.squeeze().float().item()
-                    all_scores.append(score)
-
-            if (idx + 1) % 10 == 0:
-                print(f"    Eval: {idx+1}/50 examples scored")
-
-        return float(np.mean(all_scores)), float(np.std(all_scores))
-
-    # Load reward model for evaluation
-    print("Loading reward model...")
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        reward_model_name, torch_dtype=torch.bfloat16
-    ).to(device).eval()
-
-    # Sample efficiency frontier: vary K
-    K_values = [1, 2, 3, 6]  # 6 = all pairs for 4 completions
     results = []
 
-    for K in K_values:
-        print(f"\n=== K={K} pairs per prompt ===")
+    for noise in noise_levels:
+        print(f"\n=== Noise level p={noise} ===")
 
-        torch.manual_seed(BASE_SEED)
-        np.random.seed(BASE_SEED)
-        random.seed(BASE_SEED)
+        run_data = {"dpo_agreement": [], "ggdpo_agreement": [],
+                    "bt_accuracy": []}
 
-        if K >= 6:
-            # Full DPO (upper bound)
-            pairs = build_full_dpo_pairs(train_examples)
-            label = f"Full DPO (K=6)"
-        else:
-            pairs = build_dpo_pairs(train_examples, K)
-            label = f"DPO (K={K})"
+        for run_idx in range(NUM_RUNS):
+            seed = BASE_SEED + run_idx + int(noise * 1000)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
 
-        print(f"  DPO pairs: {len(pairs)}")
-        dpo_model, dpo_loss = train_dpo_on_pairs(model_name, pairs)
-        dpo_reward_mean, dpo_reward_std = evaluate_with_reward_model(
-            dpo_model, eval_examples, reward_model
-        )
-        print(f"  DPO: loss={dpo_loss:.4f}, reward={dpo_reward_mean:.3f}+-{dpo_reward_std:.3f}")
-        del dpo_model
-        torch.cuda.empty_cache()
+            prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
 
-        # GGDPO (only if K < 6)
-        if K < 6:
-            torch.manual_seed(BASE_SEED)
-            np.random.seed(BASE_SEED)
-            random.seed(BASE_SEED)
+            pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            pi_ref.config.use_cache = False
+            pi_ref.eval()
+            pi_dpo = copy.deepcopy(pi_ref).train()
+            pi_ggdpo = copy.deepcopy(pi_ref).train()
 
-            ggdpo_pairs = build_ggdpo_pairs(train_examples, K)
-            print(f"  GGDPO pairs (expanded): {len(ggdpo_pairs)}")
-            ggdpo_model, ggdpo_loss = train_dpo_on_pairs(model_name, ggdpo_pairs)
-            ggdpo_reward_mean, ggdpo_reward_std = evaluate_with_reward_model(
-                ggdpo_model, eval_examples, reward_model
-            )
-            print(f"  GGDPO: loss={ggdpo_loss:.4f}, reward={ggdpo_reward_mean:.3f}+-{ggdpo_reward_std:.3f}")
-            del ggdpo_model
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            completions = []
+            with torch.no_grad():
+                for _ in range(N):
+                    out = pi_ref.generate(
+                        **{kk: v.clone() for kk, v in inputs.items()},
+                        max_length=20, do_sample=True, top_k=50,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+            perm = np.random.permutation(N)
+            oracle_scores = np.empty(N)
+            for rank, idx in enumerate(perm):
+                oracle_scores[idx] = rank + 1
+
+            sampled_pairs = h["sample_pairs_random"](N, K)
+            # Label with noise
+            noisy_labeled = h["label_pairs"](sampled_pairs, oracle_scores, noise_prob=noise)
+
+            # BT fitting on noisy pairs
+            bt_scores = h["fit_bradley_terry"](N, noisy_labeled)
+            bt_agree, bt_total = h["count_pair_agreements"](bt_scores, oracle_scores)
+            run_data["bt_accuracy"].append(bt_agree / bt_total)
+
+            ggdpo_graph = h["construct_full_graph"](bt_scores)
+
+            tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+            ids = tokens["input_ids"].to(device)
+            mask = tokens["attention_mask"].to(device)
+
+            with torch.no_grad():
+                ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
+
+            # DPO trains on noisy labeled pairs directly
+            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, noisy_labeled,
+                                     epochs=EPOCHS, device=device)
+            # GGDPO trains on BT-expanded pairs (denoised)
+            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, ggdpo_graph,
+                                       epochs=EPOCHS, device=device)
+
+            # Agreement with TRUE noiseless ranking
+            dpo_m = h["compute_ranking_metrics"](np.array(dpo_lps[-1]), oracle_scores)
+            ggdpo_m = h["compute_ranking_metrics"](np.array(ggdpo_lps[-1]), oracle_scores)
+
+            run_data["dpo_agreement"].append(dpo_m["pairwise_agreement"])
+            run_data["ggdpo_agreement"].append(ggdpo_m["pairwise_agreement"])
+
+            del pi_ref, pi_dpo, pi_ggdpo
             torch.cuda.empty_cache()
-        else:
-            ggdpo_loss = dpo_loss
-            ggdpo_reward_mean = dpo_reward_mean
-            ggdpo_reward_std = dpo_reward_std
 
-        results.append({
-            "K": K,
-            "oracle_queries_per_prompt": K,
-            "dpo_pairs_total": len(pairs),
-            "ggdpo_pairs_total": len(ggdpo_pairs) if K < 6 else len(pairs),
-            "dpo_loss": dpo_loss,
-            "dpo_reward_mean": dpo_reward_mean,
-            "dpo_reward_std": dpo_reward_std,
-            "ggdpo_loss": ggdpo_loss if K < 6 else None,
-            "ggdpo_reward_mean": ggdpo_reward_mean,
-            "ggdpo_reward_std": ggdpo_reward_std,
-        })
+            if (run_idx + 1) % 5 == 0:
+                print(f"  Run {run_idx+1}/{NUM_RUNS}: DPO={dpo_m['pairwise_agreement']:.3f} "
+                      f"GGDPO={ggdpo_m['pairwise_agreement']:.3f} BT_acc={bt_agree/bt_total:.3f}")
 
-    # Save
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(f"{RESULTS_DIR}/exp5_ultrafeedback.json", "w") as f:
+        result = {
+            "noise": noise, "N": N, "K": K,
+            "dpo_agreement_mean": float(np.mean(run_data["dpo_agreement"])),
+            "dpo_agreement_std": float(np.std(run_data["dpo_agreement"])),
+            "ggdpo_agreement_mean": float(np.mean(run_data["ggdpo_agreement"])),
+            "ggdpo_agreement_std": float(np.std(run_data["ggdpo_agreement"])),
+            "bt_accuracy_mean": float(np.mean(run_data["bt_accuracy"])),
+            "bt_accuracy_std": float(np.std(run_data["bt_accuracy"])),
+            "improvement": float(np.mean(run_data["ggdpo_agreement"]) - np.mean(run_data["dpo_agreement"])),
+        }
+        results.append(result)
+        print(f"  p={noise}: DPO={result['dpo_agreement_mean']:.3f}+-{result['dpo_agreement_std']:.3f} "
+              f"GGDPO={result['ggdpo_agreement_mean']:.3f}+-{result['ggdpo_agreement_std']:.3f} "
+              f"Improvement={result['improvement']:+.3f}")
+
+    with open(os.path.join(RESULTS_DIR, "exp7_noisy_oracle.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Plot: Sample Efficiency Frontier
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ks = [r["K"] for r in results]
-    dpo_rewards = [r["dpo_reward_mean"] for r in results]
-    ggdpo_rewards = [r["ggdpo_reward_mean"] for r in results]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    ax.plot(ks, dpo_rewards, "o-", label="DPO", color="tab:blue", markersize=8)
-    ax.plot(ks, ggdpo_rewards, "x-", label="GGDPO", color="tab:orange", markersize=8)
-    ax.set_xlabel("Oracle Queries per Prompt (K)")
-    ax.set_ylabel("Post-Alignment Reward Score")
-    ax.set_title("Sample Efficiency Frontier: UltraFeedback")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    noises = [r["noise"] for r in results]
+    dpo_means = [r["dpo_agreement_mean"] for r in results]
+    dpo_stds = [r["dpo_agreement_std"] for r in results]
+    ggdpo_means = [r["ggdpo_agreement_mean"] for r in results]
+    ggdpo_stds = [r["ggdpo_agreement_std"] for r in results]
+    bt_means = [r["bt_accuracy_mean"] for r in results]
+
+    ax1.errorbar(noises, dpo_means, yerr=dpo_stds, marker='o', capsize=4, label='DPO (noisy pairs)')
+    ax1.errorbar(noises, ggdpo_means, yerr=ggdpo_stds, marker='x', capsize=4, label='GGDPO (BT-denoised)')
+    ax1.plot(noises, bt_means, marker='s', linestyle='--', alpha=0.5, label='BT Estimation Accuracy')
+    ax1.set_xlabel("Noise Level (p)")
+    ax1.set_ylabel("Oracle Agreement (with true ranking)")
+    ax1.set_title("Noisy Oracle: GGDPO Denoising Effect")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    improvements = [r["improvement"] for r in results]
+    bar_colors = ['green' if v > 0 else 'red' for v in improvements]
+    ax2.bar([f"{n:.2f}" for n in noises], improvements, color=bar_colors, alpha=0.7)
+    ax2.set_xlabel("Noise Level (p)")
+    ax2.set_ylabel("GGDPO - DPO Agreement")
+    ax2.set_title("GGDPO Improvement at Each Noise Level")
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(f"{RESULTS_DIR}/exp5_sample_efficiency.png", dpi=150)
+    plt.savefig(os.path.join(RESULTS_DIR, "exp7_noisy_oracle.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     results_vol.commit()
-    print("\n=== Experiment 5 (UltraFeedback) Complete ===")
+    print("\n=== Experiment 7 Complete ===")
     print(json.dumps(results, indent=2))
-    return results
 
 
 # ============================================================
-# Run all experiments
+# Experiment 8: Held-Out Pair Prediction (Cross-Validation)
 # ============================================================
 
-@app.local_entrypoint()
-def main():
-    """Run all experiments sequentially."""
-    print("Starting GGDPO experiments...")
+@app.function(**COMMON_KWARGS)
+def exp8_heldout_prediction():
+    """
+    Directly test whether GGDPO's BT-inferred preferences are correct on unseen pairs.
+    GPT-2, N=20, all 190 oracle pairs known (ground truth).
+    Split: K train pairs, (190-K) held-out test pairs.
+    K sweep: {19, 30, 40, 60, 95}.
+    Evaluate: agreement with held-out (190-K) test pairs.
+    """
+    import copy
+    import random
+    import string
+    import json
+    import os
+    import numpy as np
+    import torch
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-    print("\n" + "=" * 60)
-    print("EXPERIMENT 1: Synthetic N/K Sweep")
-    print("=" * 60)
-    r1 = exp1_synthetic_sweep.remote()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
-    print("\n" + "=" * 60)
-    print("EXPERIMENT 2: Scaling N")
-    print("=" * 60)
-    r2 = exp2_scaling_n.remote()
+    h = _ggdpo_helpers()
+    BASE_SEED = 42
 
-    print("\n" + "=" * 60)
-    print("EXPERIMENT 3: Ablations")
-    print("=" * 60)
-    r3 = exp3_ablations.remote()
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    print("\n" + "=" * 60)
-    print("EXPERIMENT 4: Reward Model Scaled")
-    print("=" * 60)
-    r4 = exp4_reward_model_scaled.remote()
+    N = 20
+    MAX_PAIRS = N * (N - 1) // 2  # 190
+    K_values = [19, 30, 40, 60, 95]
+    NUM_RUNS = 20
+    EPOCHS = 200
 
-    print("\n" + "=" * 60)
-    print("EXPERIMENT 5: UltraFeedback")
-    print("=" * 60)
-    r5 = exp5_ultrafeedback.remote()
+    results = []
 
-    print("\n\nAll experiments complete!")
+    for K in K_values:
+        print(f"\n=== K={K} train pairs, {MAX_PAIRS - K} held-out test pairs ===")
+
+        run_data = {
+            "bt_heldout_accuracy": [],
+            "dpo_heldout_agreement": [],
+            "ggdpo_heldout_agreement": [],
+            "dpo_full_agreement": [],
+            "ggdpo_full_agreement": [],
+        }
+
+        for run_idx in range(NUM_RUNS):
+            seed = BASE_SEED + run_idx + K * 100
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
+
+            pi_ref = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            pi_ref.config.use_cache = False
+            pi_ref.eval()
+            pi_dpo = copy.deepcopy(pi_ref).train()
+            pi_ggdpo = copy.deepcopy(pi_ref).train()
+
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            completions = []
+            with torch.no_grad():
+                for _ in range(N):
+                    out = pi_ref.generate(
+                        **{kk: v.clone() for kk, v in inputs.items()},
+                        max_length=20, do_sample=True, top_k=50,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+            perm = np.random.permutation(N)
+            oracle_scores = np.empty(N)
+            for rank, idx in enumerate(perm):
+                oracle_scores[idx] = rank + 1
+
+            # Generate ALL pairs and label them
+            all_pairs = []
+            for i in range(N):
+                for j in range(i + 1, N):
+                    all_pairs.append((i, j))
+            random.shuffle(all_pairs)
+
+            all_labeled = h["label_pairs"](all_pairs, oracle_scores)
+
+            # Split into train and held-out
+            train_pairs = all_pairs[:K]
+            train_labeled = all_labeled[:K]
+            heldout_pairs = all_pairs[K:]
+            heldout_labeled = all_labeled[K:]
+
+            # BT estimation from train pairs
+            bt_scores = h["fit_bradley_terry"](N, train_labeled)
+            ggdpo_graph = h["construct_full_graph"](bt_scores)
+
+            # BT accuracy on held-out pairs
+            bt_heldout_agree = 0
+            for (w, l) in heldout_labeled:
+                if bt_scores[w] > bt_scores[l]:
+                    bt_heldout_agree += 1
+            bt_heldout_accuracy = bt_heldout_agree / len(heldout_labeled) if heldout_labeled else 0
+            run_data["bt_heldout_accuracy"].append(bt_heldout_accuracy)
+
+            tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+            ids = tokens["input_ids"].to(device)
+            mask = tokens["attention_mask"].to(device)
+
+            with torch.no_grad():
+                ref_lp = h["get_log_prob_sums"](pi_ref, ids, mask)
+
+            # DPO trains on K train pairs only
+            dpo_lps = h["train_dpo"](pi_dpo, ref_lp, ids, mask, train_labeled,
+                                     epochs=EPOCHS, device=device)
+            # GGDPO trains on BT-expanded full graph
+            ggdpo_lps = h["train_dpo"](pi_ggdpo, ref_lp, ids, mask, ggdpo_graph,
+                                       epochs=EPOCHS, device=device)
+
+            dpo_final = np.array(dpo_lps[-1])
+            ggdpo_final = np.array(ggdpo_lps[-1])
+
+            # Agreement on held-out pairs
+            dpo_heldout_agree = 0
+            ggdpo_heldout_agree = 0
+            for (w, l) in heldout_labeled:
+                if dpo_final[w] > dpo_final[l]:
+                    dpo_heldout_agree += 1
+                if ggdpo_final[w] > ggdpo_final[l]:
+                    ggdpo_heldout_agree += 1
+
+            n_heldout = len(heldout_labeled)
+            run_data["dpo_heldout_agreement"].append(dpo_heldout_agree / n_heldout if n_heldout > 0 else 0)
+            run_data["ggdpo_heldout_agreement"].append(ggdpo_heldout_agree / n_heldout if n_heldout > 0 else 0)
+
+            # Full agreement
+            dpo_m = h["compute_ranking_metrics"](dpo_final, oracle_scores)
+            ggdpo_m = h["compute_ranking_metrics"](ggdpo_final, oracle_scores)
+            run_data["dpo_full_agreement"].append(dpo_m["pairwise_agreement"])
+            run_data["ggdpo_full_agreement"].append(ggdpo_m["pairwise_agreement"])
+
+            del pi_ref, pi_dpo, pi_ggdpo
+            torch.cuda.empty_cache()
+
+            if (run_idx + 1) % 5 == 0:
+                print(f"  Run {run_idx+1}/{NUM_RUNS}: "
+                      f"DPO heldout={dpo_heldout_agree/n_heldout:.3f} "
+                      f"GGDPO heldout={ggdpo_heldout_agree/n_heldout:.3f} "
+                      f"BT heldout={bt_heldout_accuracy:.3f}")
+
+        result = {
+            "K": K, "N": N, "heldout_size": MAX_PAIRS - K,
+            "bt_heldout_accuracy_mean": float(np.mean(run_data["bt_heldout_accuracy"])),
+            "bt_heldout_accuracy_std": float(np.std(run_data["bt_heldout_accuracy"])),
+            "dpo_heldout_agreement_mean": float(np.mean(run_data["dpo_heldout_agreement"])),
+            "dpo_heldout_agreement_std": float(np.std(run_data["dpo_heldout_agreement"])),
+            "ggdpo_heldout_agreement_mean": float(np.mean(run_data["ggdpo_heldout_agreement"])),
+            "ggdpo_heldout_agreement_std": float(np.std(run_data["ggdpo_heldout_agreement"])),
+            "dpo_full_agreement_mean": float(np.mean(run_data["dpo_full_agreement"])),
+            "ggdpo_full_agreement_mean": float(np.mean(run_data["ggdpo_full_agreement"])),
+            "heldout_improvement": float(np.mean(run_data["ggdpo_heldout_agreement"]) - np.mean(run_data["dpo_heldout_agreement"])),
+        }
+        results.append(result)
+        print(f"  K={K}: DPO heldout={result['dpo_heldout_agreement_mean']:.3f} "
+              f"GGDPO heldout={result['ggdpo_heldout_agreement_mean']:.3f} "
+              f"Improvement={result['heldout_improvement']:+.3f}")
+
+    with open(os.path.join(RESULTS_DIR, "exp8_heldout_prediction.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    Ks = [r["K"] for r in results]
+    dpo_h = [r["dpo_heldout_agreement_mean"] for r in results]
+    dpo_hs = [r["dpo_heldout_agreement_std"] for r in results]
+    ggdpo_h = [r["ggdpo_heldout_agreement_mean"] for r in results]
+    ggdpo_hs = [r["ggdpo_heldout_agreement_std"] for r in results]
+    bt_h = [r["bt_heldout_accuracy_mean"] for r in results]
+    bt_hs = [r["bt_heldout_accuracy_std"] for r in results]
+
+    ax1.errorbar(Ks, dpo_h, yerr=dpo_hs, marker='o', capsize=4, label='DPO (K pairs)')
+    ax1.errorbar(Ks, ggdpo_h, yerr=ggdpo_hs, marker='x', capsize=4, label='GGDPO (BT-expanded)')
+    ax1.errorbar(Ks, bt_h, yerr=bt_hs, marker='s', capsize=4, linestyle='--', alpha=0.5, label='BT Estimation Only')
+    ax1.set_xlabel("K (train pairs)")
+    ax1.set_ylabel("Held-Out Pair Agreement")
+    ax1.set_title(f"Held-Out Prediction (N={N}, {MAX_PAIRS} total pairs)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    improvements = [r["heldout_improvement"] for r in results]
+    bar_colors = ['green' if v > 0 else 'red' for v in improvements]
+    ax2.bar([str(k) for k in Ks], improvements, color=bar_colors, alpha=0.7)
+    ax2.set_xlabel("K (train pairs)")
+    ax2.set_ylabel("GGDPO - DPO Held-Out Agreement")
+    ax2.set_title("GGDPO Improvement on Held-Out Pairs")
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp8_heldout_prediction.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+    print("\n=== Experiment 8 Complete ===")
+    print(json.dumps(results, indent=2))

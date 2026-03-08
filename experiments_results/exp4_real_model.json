@@ -1,0 +1,38 @@
+[
+  {
+    "N": 10,
+    "K": 10,
+    "max_pairs": 45,
+    "dpo_reward_mean": 1.4022928873697917,
+    "dpo_reward_std": 0.3643601218239179,
+    "ggdpo_reward_mean": 1.5303395589192708,
+    "ggdpo_reward_std": 0.13186582987199957,
+    "dpo_grad_variance_mean": 2.471735937484088,
+    "ggdpo_grad_variance_mean": 2.7359023005044265,
+    "reward_improvement": 0.12804667154947902
+  },
+  {
+    "N": 20,
+    "K": 20,
+    "max_pairs": 190,
+    "dpo_reward_mean": 1.3900665283203126,
+    "dpo_reward_std": 0.045444494615841206,
+    "ggdpo_reward_mean": 1.6150049845377605,
+    "ggdpo_reward_std": 0.09894433219736713,
+    "dpo_grad_variance_mean": 2.6613369493604155,
+    "ggdpo_grad_variance_mean": 13.313136546657427,
+    "reward_improvement": 0.2249384562174479
+  },
+  {
+    "N": 30,
+    "K": 30,
+    "max_pairs": 435,
+    "dpo_reward_mean": 1.626269022623698,
+    "dpo_reward_std": 0.12591064790274545,
+    "ggdpo_reward_mean": 1.6677571614583335,
+    "ggdpo_reward_std": 0.24486963308804482,
+    "dpo_grad_variance_mean": 3.6528819424227,
+    "ggdpo_grad_variance_mean": 30.675232377843514,
+    "reward_improvement": 0.041488138834635535
+  }
+]

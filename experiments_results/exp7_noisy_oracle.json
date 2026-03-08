@@ -1,0 +1,86 @@
+[
+  {
+    "noise": 0.0,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.8700000000000001,
+    "dpo_agreement_std": 0.03906793896374984,
+    "ggdpo_agreement_mean": 0.8633333333333335,
+    "ggdpo_agreement_std": 0.035414615786958176,
+    "bt_accuracy_mean": 0.8704761904761906,
+    "bt_accuracy_std": 0.031929627836648024,
+    "improvement": -0.006666666666666599
+  },
+  {
+    "noise": 0.05,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.8347619047619048,
+    "dpo_agreement_std": 0.0417611174384165,
+    "ggdpo_agreement_mean": 0.8404761904761905,
+    "ggdpo_agreement_std": 0.03587266469837943,
+    "bt_accuracy_mean": 0.8428571428571429,
+    "bt_accuracy_std": 0.03791624616646548,
+    "improvement": 0.005714285714285672
+  },
+  {
+    "noise": 0.1,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.8047619047619048,
+    "dpo_agreement_std": 0.06601724504999379,
+    "ggdpo_agreement_mean": 0.800952380952381,
+    "ggdpo_agreement_std": 0.07252491947998446,
+    "bt_accuracy_mean": 0.8066666666666666,
+    "bt_accuracy_std": 0.06947160466604528,
+    "improvement": -0.003809523809523818
+  },
+  {
+    "noise": 0.15,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.7490476190476191,
+    "dpo_agreement_std": 0.06319354426111248,
+    "ggdpo_agreement_mean": 0.7514285714285714,
+    "ggdpo_agreement_std": 0.06747133430117527,
+    "bt_accuracy_mean": 0.7471428571428571,
+    "bt_accuracy_std": 0.06697039654657454,
+    "improvement": 0.0023809523809523725
+  },
+  {
+    "noise": 0.2,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.7233333333333333,
+    "dpo_agreement_std": 0.06717324540290713,
+    "ggdpo_agreement_mean": 0.7257142857142858,
+    "ggdpo_agreement_std": 0.06442489342966767,
+    "bt_accuracy_mean": 0.7261904761904763,
+    "bt_accuracy_std": 0.06500479661353029,
+    "improvement": 0.0023809523809524835
+  },
+  {
+    "noise": 0.25,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.689047619047619,
+    "dpo_agreement_std": 0.09111429118945566,
+    "ggdpo_agreement_mean": 0.6857142857142857,
+    "ggdpo_agreement_std": 0.09745049327456369,
+    "bt_accuracy_mean": 0.6842857142857143,
+    "bt_accuracy_std": 0.0966690124040981,
+    "improvement": -0.0033333333333332993
+  },
+  {
+    "noise": 0.3,
+    "N": 15,
+    "K": 30,
+    "dpo_agreement_mean": 0.6628571428571428,
+    "dpo_agreement_std": 0.11120449590415422,
+    "ggdpo_agreement_mean": 0.6566666666666665,
+    "ggdpo_agreement_std": 0.1103478318361068,
+    "bt_accuracy_mean": 0.6561904761904761,
+    "bt_accuracy_std": 0.11396383242959504,
+    "improvement": -0.006190476190476302
+  }
+]

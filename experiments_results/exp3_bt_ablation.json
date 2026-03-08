@@ -1,0 +1,56 @@
+{
+  "graph_estimation_methods": {
+    "bradley_terry": {
+      "agreement_mean": 0.7734210526315788,
+      "agreement_std": 0.054148533792812495,
+      "kendall_mean": 0.5468421052631578
+    },
+    "win_rate": {
+      "agreement_mean": 0.7542105263157894,
+      "agreement_std": 0.04639646084506197,
+      "kendall_mean": 0.508421052631579
+    },
+    "transitive_closure": {
+      "agreement_mean": 0.7673684210526315,
+      "agreement_std": 0.04670885838386061,
+      "kendall_mean": 0.5347368421052632
+    },
+    "dpo_baseline": {
+      "agreement_mean": 0.7947368421052633,
+      "agreement_std": 0.04403473823863555,
+      "kendall_mean": 0.5894736842105265
+    }
+  },
+  "bt_accuracy_vs_k": [
+    {
+      "K": 10,
+      "bt_accuracy_mean": 0.6813157894736842,
+      "bt_accuracy_std": 0.049189412864458326
+    },
+    {
+      "K": 15,
+      "bt_accuracy_mean": 0.7126315789473685,
+      "bt_accuracy_std": 0.042413346564012175
+    },
+    {
+      "K": 20,
+      "bt_accuracy_mean": 0.7742105263157895,
+      "bt_accuracy_std": 0.03502670133047334
+    },
+    {
+      "K": 30,
+      "bt_accuracy_mean": 0.8439473684210526,
+      "bt_accuracy_std": 0.03440330300447516
+    },
+    {
+      "K": 40,
+      "bt_accuracy_mean": 0.8663157894736843,
+      "bt_accuracy_std": 0.039153084028204825
+    },
+    {
+      "K": 60,
+      "bt_accuracy_mean": 0.9094736842105263,
+      "bt_accuracy_std": 0.020761139919280015
+    }
+  ]
+}

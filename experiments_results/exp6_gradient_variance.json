@@ -1,0 +1,301 @@
+{
+  "summary": {
+    "N": 20,
+    "K": 20,
+    "max_pairs": 190,
+    "num_runs": 20,
+    "dpo_grad_norm_variance_mean": 2.854059601679057,
+    "dpo_grad_norm_variance_std": 2.7377207030180633,
+    "ggdpo_grad_norm_variance_mean": 51.94220878941398,
+    "ggdpo_grad_norm_variance_std": 15.888877114511232,
+    "dpo_cosine_sim_mean": 0.511867294088006,
+    "ggdpo_cosine_sim_mean": 0.32730231948785093,
+    "variance_reduction_ratio": 0.054946827795677514
+  },
+  "raw": {
+    "dpo": [
+      {
+        "full_grad_norm": 15.400618553161621,
+        "grad_norm_variance": 8.477198634886918,
+        "grad_norm_mean": 20.843453407287598,
+        "cosine_sim_mean": 0.5291789472103119,
+        "cosine_sim_std": 0.009366065263748169
+      },
+      {
+        "full_grad_norm": 12.934699058532715,
+        "grad_norm_variance": 0.0028024806852045003,
+        "grad_norm_mean": 18.654653549194336,
+        "cosine_sim_mean": 0.5945929288864136,
+        "cosine_sim_std": 0.004579424858093262
+      },
+      {
+        "full_grad_norm": 12.60492992401123,
+        "grad_norm_variance": 1.2435743552507574,
+        "grad_norm_mean": 13.656147480010986,
+        "cosine_sim_mean": 0.5934581458568573,
+        "cosine_sim_std": 0.0641123354434967
+      },
+      {
+        "full_grad_norm": 14.284198760986328,
+        "grad_norm_variance": 5.4969488640947475,
+        "grad_norm_mean": 18.073615550994873,
+        "cosine_sim_mean": 0.55552177131176,
+        "cosine_sim_std": 0.1096704751253128
+      },
+      {
+        "full_grad_norm": 11.484918594360352,
+        "grad_norm_variance": 6.032520839431754,
+        "grad_norm_mean": 15.13659143447876,
+        "cosine_sim_mean": 0.49936649203300476,
+        "cosine_sim_std": 0.10081186890602112
+      },
+      {
+        "full_grad_norm": 13.800914764404297,
+        "grad_norm_variance": 1.118840582381381,
+        "grad_norm_mean": 17.543725967407227,
+        "cosine_sim_mean": 0.5803359746932983,
+        "cosine_sim_std": 0.04050588607788086
+      },
+      {
+        "full_grad_norm": 10.678668975830078,
+        "grad_norm_variance": 0.6055628186004469,
+        "grad_norm_mean": 14.48769474029541,
+        "cosine_sim_mean": 0.4062090367078781,
+        "cosine_sim_std": 0.0073620229959487915
+      },
+      {
+        "full_grad_norm": 14.345683097839355,
+        "grad_norm_variance": 2.346973062959478,
+        "grad_norm_mean": 21.403054237365723,
+        "cosine_sim_mean": 0.5517004728317261,
+        "cosine_sim_std": 0.02652764320373535
+      },
+      {
+        "full_grad_norm": 8.718944549560547,
+        "grad_norm_variance": 2.135305409866305,
+        "grad_norm_mean": 14.041979789733887,
+        "cosine_sim_mean": 0.3672427013516426,
+        "cosine_sim_std": 0.2323073074221611
+      },
+      {
+        "full_grad_norm": 13.000449180603027,
+        "grad_norm_variance": 2.382755682083598,
+        "grad_norm_mean": 14.856128215789795,
+        "cosine_sim_mean": 0.5414369106292725,
+        "cosine_sim_std": 0.013854682445526123
+      },
+      {
+        "full_grad_norm": 10.082708358764648,
+        "grad_norm_variance": 1.5093994382189067,
+        "grad_norm_mean": 16.615797519683838,
+        "cosine_sim_mean": 0.5702910423278809,
+        "cosine_sim_std": 0.023244380950927734
+      },
+      {
+        "full_grad_norm": 13.81625747680664,
+        "grad_norm_variance": 6.797400602627931,
+        "grad_norm_mean": 15.786322593688965,
+        "cosine_sim_mean": 0.5008670091629028,
+        "cosine_sim_std": 0.022083401679992676
+      },
+      {
+        "full_grad_norm": 11.478468894958496,
+        "grad_norm_variance": 0.1884388012731506,
+        "grad_norm_mean": 15.289445877075195,
+        "cosine_sim_mean": 0.5992162525653839,
+        "cosine_sim_std": 0.0448279082775116
+      },
+      {
+        "full_grad_norm": 11.802779197692871,
+        "grad_norm_variance": 3.4302228003152777,
+        "grad_norm_mean": 15.019583702087402,
+        "cosine_sim_mean": 0.5574480295181274,
+        "cosine_sim_std": 0.1513705849647522
+      },
+      {
+        "full_grad_norm": 14.484728813171387,
+        "grad_norm_variance": 7.575881196276896,
+        "grad_norm_mean": 21.735721588134766,
+        "cosine_sim_mean": 0.3676200360059738,
+        "cosine_sim_std": 0.10374443233013153
+      },
+      {
+        "full_grad_norm": 11.658005714416504,
+        "grad_norm_variance": 1.214649404806778,
+        "grad_norm_mean": 14.54167890548706,
+        "cosine_sim_mean": 0.501340925693512,
+        "cosine_sim_std": 0.08256489038467407
+      },
+      {
+        "full_grad_norm": 9.803918838500977,
+        "grad_norm_variance": 0.3561797371751254,
+        "grad_norm_mean": 10.83262300491333,
+        "cosine_sim_mean": 0.4708082675933838,
+        "cosine_sim_std": 0.03384512662887573
+      },
+      {
+        "full_grad_norm": 13.45573616027832,
+        "grad_norm_variance": 6.011360011818624,
+        "grad_norm_mean": 16.17017889022827,
+        "cosine_sim_mean": 0.5339089632034302,
+        "cosine_sim_std": 0.019333064556121826
+      },
+      {
+        "full_grad_norm": 11.71424388885498,
+        "grad_norm_variance": 0.02833200369991573,
+        "grad_norm_mean": 16.014862537384033,
+        "cosine_sim_mean": 0.5271802246570587,
+        "cosine_sim_std": 0.1036824882030487
+      },
+      {
+        "full_grad_norm": 12.824858665466309,
+        "grad_norm_variance": 0.12684530712795095,
+        "grad_norm_mean": 15.605347633361816,
+        "cosine_sim_mean": 0.3896217495203018,
+        "cosine_sim_std": 0.08767040073871613
+      }
+    ],
+    "ggdpo": [
+      {
+        "full_grad_norm": 14.945242881774902,
+        "grad_norm_variance": 63.157030183285976,
+        "grad_norm_mean": 26.730392355667917,
+        "cosine_sim_mean": 0.4186214522311562,
+        "cosine_sim_std": 0.10989008828874612
+      },
+      {
+        "full_grad_norm": 9.823599815368652,
+        "grad_norm_variance": 47.03516018996984,
+        "grad_norm_mean": 20.727531734265778,
+        "cosine_sim_mean": 0.3600605357634394,
+        "cosine_sim_std": 0.10288346456252076
+      },
+      {
+        "full_grad_norm": 8.295210838317871,
+        "grad_norm_variance": 50.25489640491729,
+        "grad_norm_mean": 19.47424808301424,
+        "cosine_sim_mean": 0.31337155793842514,
+        "cosine_sim_std": 0.1572176346192341
+      },
+      {
+        "full_grad_norm": 11.361445426940918,
+        "grad_norm_variance": 61.47223025817025,
+        "grad_norm_mean": 21.76096268704063,
+        "cosine_sim_mean": 0.41642677470257405,
+        "cosine_sim_std": 0.09406301358672958
+      },
+      {
+        "full_grad_norm": 8.398918151855469,
+        "grad_norm_variance": 22.014276537593705,
+        "grad_norm_mean": 20.593823282342207,
+        "cosine_sim_mean": 0.2871735166562231,
+        "cosine_sim_std": 0.10033728630345355
+      },
+      {
+        "full_grad_norm": 8.557711601257324,
+        "grad_norm_variance": 37.24446097498803,
+        "grad_norm_mean": 24.39167002627724,
+        "cosine_sim_mean": 0.3001328444010333,
+        "cosine_sim_std": 0.12077778939531822
+      },
+      {
+        "full_grad_norm": 8.609318733215332,
+        "grad_norm_variance": 54.89590598446874,
+        "grad_norm_mean": 20.37401550694516,
+        "cosine_sim_mean": 0.33519417125927775,
+        "cosine_sim_std": 0.14117382697362174
+      },
+      {
+        "full_grad_norm": 12.178516387939453,
+        "grad_norm_variance": 80.94851172166294,
+        "grad_norm_mean": 26.369599894473428,
+        "cosine_sim_mean": 0.27509739426405805,
+        "cosine_sim_std": 0.11050288448340737
+      },
+      {
+        "full_grad_norm": 7.613847732543945,
+        "grad_norm_variance": 35.55337116444755,
+        "grad_norm_mean": 19.02679287759881,
+        "cosine_sim_mean": 0.2408970360104975,
+        "cosine_sim_std": 0.11091313358275179
+      },
+      {
+        "full_grad_norm": 10.106596946716309,
+        "grad_norm_variance": 36.00672030935632,
+        "grad_norm_mean": 19.405801722877904,
+        "cosine_sim_mean": 0.38749399859654277,
+        "cosine_sim_std": 0.10859647268758871
+      },
+      {
+        "full_grad_norm": 9.373214721679688,
+        "grad_norm_variance": 65.74062413662476,
+        "grad_norm_mean": 21.619212351347272,
+        "cosine_sim_mean": 0.30582635771287114,
+        "cosine_sim_std": 0.11335553228866965
+      },
+      {
+        "full_grad_norm": 9.391290664672852,
+        "grad_norm_variance": 57.333773136719174,
+        "grad_norm_mean": 21.783331871032715,
+        "cosine_sim_mean": 0.31955471752505554,
+        "cosine_sim_std": 0.13159855690485303
+      },
+      {
+        "full_grad_norm": 8.778121948242188,
+        "grad_norm_variance": 48.38088915504381,
+        "grad_norm_mean": 20.598027630856162,
+        "cosine_sim_mean": 0.37275482478894684,
+        "cosine_sim_std": 0.21831449025007182
+      },
+      {
+        "full_grad_norm": 12.077725410461426,
+        "grad_norm_variance": 24.447181957610166,
+        "grad_norm_mean": 17.533259692944977,
+        "cosine_sim_mean": 0.5048969638975043,
+        "cosine_sim_std": 0.11551485543088669
+      },
+      {
+        "full_grad_norm": 13.175514221191406,
+        "grad_norm_variance": 66.6840445099291,
+        "grad_norm_mean": 24.10208225250244,
+        "cosine_sim_mean": 0.1753786922873635,
+        "cosine_sim_std": 0.15641664737839187
+      },
+      {
+        "full_grad_norm": 9.276229858398438,
+        "grad_norm_variance": 41.60117314568164,
+        "grad_norm_mean": 18.785537920500104,
+        "cosine_sim_mean": 0.35011744185497884,
+        "cosine_sim_std": 0.12777492106702182
+      },
+      {
+        "full_grad_norm": 7.188241481781006,
+        "grad_norm_variance": 52.80280029014354,
+        "grad_norm_mean": 17.83498272142912,
+        "cosine_sim_mean": 0.2810631323801844,
+        "cosine_sim_std": 0.08176251623619864
+      },
+      {
+        "full_grad_norm": 8.720564842224121,
+        "grad_norm_variance": 45.885683501422804,
+        "grad_norm_mean": 19.345604846352025,
+        "cosine_sim_mean": 0.28527010153782995,
+        "cosine_sim_std": 0.11813133641381127
+      },
+      {
+        "full_grad_norm": 9.832582473754883,
+        "grad_norm_variance": 70.13569736659235,
+        "grad_norm_mean": 20.47904953203703,
+        "cosine_sim_mean": 0.37667449602955266,
+        "cosine_sim_std": 0.10218468687006088
+      },
+      {
+        "full_grad_norm": 9.662492752075195,
+        "grad_norm_variance": 77.24974485965177,
+        "grad_norm_mean": 19.857345480667917,
+        "cosine_sim_mean": 0.24004037991950386,
+        "cosine_sim_std": 0.12279732165742528
+      }
+    ]
+  }
+}
