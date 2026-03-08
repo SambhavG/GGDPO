@@ -1,0 +1,41 @@
+[
+  {
+    "N": 15,
+    "K": 15,
+    "dpo_agreement_mean": 0.781904761904762,
+    "dpo_agreement_std": 0.0475141702219673,
+    "ggdpo_agreement_mean": 0.7980952380952381,
+    "ggdpo_agreement_std": 0.04583317872577511,
+    "bt_accuracy_mean": 0.799047619047619,
+    "dpo_reward_mean": 3.0298535156250006,
+    "dpo_reward_std": 1.2441723284216746,
+    "ggdpo_reward_mean": 2.8301904296875,
+    "ggdpo_reward_std": 0.870094683540029
+  },
+  {
+    "N": 30,
+    "K": 30,
+    "dpo_agreement_mean": 0.7195402298850574,
+    "dpo_agreement_std": 0.04924049925697579,
+    "ggdpo_agreement_mean": 0.7505747126436781,
+    "ggdpo_agreement_std": 0.03419419489803107,
+    "bt_accuracy_mean": 0.7558620689655173,
+    "dpo_reward_mean": 3.19112060546875,
+    "dpo_reward_std": 1.0230640495318155,
+    "ggdpo_reward_mean": 3.4958837890625,
+    "ggdpo_reward_std": 0.698742176500037
+  },
+  {
+    "N": 50,
+    "K": 50,
+    "dpo_agreement_mean": 0.7310204081632653,
+    "dpo_agreement_std": 0.02419482219555565,
+    "ggdpo_agreement_mean": 0.7473469387755102,
+    "ggdpo_agreement_std": 0.02405671488438804,
+    "bt_accuracy_mean": 0.752326530612245,
+    "dpo_reward_mean": 3.1912255859374996,
+    "dpo_reward_std": 1.0160106469149368,
+    "ggdpo_reward_mean": 3.4877429199218755,
+    "ggdpo_reward_std": 1.0759252937477912
+  }
+]

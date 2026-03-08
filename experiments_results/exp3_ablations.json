@@ -1,0 +1,51 @@
+{
+  "graph_estimation_methods": {
+    "bradley_terry": {
+      "agreement_mean": 0.7645977011494253,
+      "agreement_std": 0.03976679276536775,
+      "kendall_mean": 0.5291954022988506
+    },
+    "win_rate": {
+      "agreement_mean": 0.7245977011494252,
+      "agreement_std": 0.03615559218636782,
+      "kendall_mean": 0.4491954022988506
+    },
+    "transitive_closure": {
+      "agreement_mean": 0.6958620689655173,
+      "agreement_std": 0.04996550534256541,
+      "kendall_mean": 0.39172413793103444
+    },
+    "dpo_baseline": {
+      "agreement_mean": 0.7662068965517241,
+      "agreement_std": 0.02836170503673626,
+      "kendall_mean": 0.5324137931034484
+    }
+  },
+  "confidence_weighting": {
+    "unweighted": {
+      "agreement_mean": 0.7786206896551724,
+      "agreement_std": 0.03769063492292372
+    },
+    "confidence_weighted": {
+      "agreement_mean": 0.7760919540229885,
+      "agreement_std": 0.0317574371298007
+    }
+  },
+  "graph_sampling_structure": {
+    "random": {
+      "agreement_mean": 0.7717241379310347,
+      "agreement_std": 0.03392732746158216,
+      "bt_accuracy_mean": 0.7763218390804598
+    },
+    "chain": {
+      "agreement_mean": 0.7774712643678161,
+      "agreement_std": 0.040862675197986094,
+      "bt_accuracy_mean": 0.7806896551724137
+    },
+    "star": {
+      "agreement_mean": 0.667816091954023,
+      "agreement_std": 0.10556330850250471,
+      "bt_accuracy_mean": 0.677471264367816
+    }
+  }
+}

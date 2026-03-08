@@ -1,0 +1,50 @@
+[
+  {
+    "K": 1,
+    "oracle_queries_per_prompt": 1,
+    "dpo_pairs_total": 500,
+    "ggdpo_pairs_total": 3000,
+    "dpo_loss": 0.6239895833333333,
+    "dpo_reward_mean": 1.572198486328125,
+    "dpo_reward_std": 2.1647184322168083,
+    "ggdpo_loss": 0.568703125,
+    "ggdpo_reward_mean": 1.7628759765625,
+    "ggdpo_reward_std": 1.9843180738739257
+  },
+  {
+    "K": 2,
+    "oracle_queries_per_prompt": 2,
+    "dpo_pairs_total": 1000,
+    "ggdpo_pairs_total": 3000,
+    "dpo_loss": 0.5984752604166667,
+    "dpo_reward_mean": 1.90988525390625,
+    "dpo_reward_std": 1.886896741742752,
+    "ggdpo_loss": 0.5621384548611111,
+    "ggdpo_reward_mean": 1.825943603515625,
+    "ggdpo_reward_std": 2.158625288028111
+  },
+  {
+    "K": 3,
+    "oracle_queries_per_prompt": 3,
+    "dpo_pairs_total": 1500,
+    "ggdpo_pairs_total": 3000,
+    "dpo_loss": 0.5584435763888889,
+    "dpo_reward_mean": 1.5038284301757812,
+    "dpo_reward_std": 1.8925527769315094,
+    "ggdpo_loss": 0.5425479600694444,
+    "ggdpo_reward_mean": 1.6188717651367188,
+    "ggdpo_reward_std": 2.0910857803303546
+  },
+  {
+    "K": 6,
+    "oracle_queries_per_prompt": 6,
+    "dpo_pairs_total": 3000,
+    "ggdpo_pairs_total": 3000,
+    "dpo_loss": 0.5207408854166666,
+    "dpo_reward_mean": 1.78466796875,
+    "dpo_reward_std": 1.97987986821534,
+    "ggdpo_loss": null,
+    "ggdpo_reward_mean": 1.78466796875,
+    "ggdpo_reward_std": 1.97987986821534
+  }
+]
