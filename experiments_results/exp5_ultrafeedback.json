@@ -1,0 +1,62 @@
+[
+  {
+    "K": 1,
+    "N": 4,
+    "max_pairs": 6,
+    "dpo_reward_mean": 1.6507731119791667,
+    "dpo_reward_std": 0.17907345849028927,
+    "ggdpo_reward_mean": 1.6852657063802081,
+    "ggdpo_reward_std": 0.11268365214712076,
+    "dpo_uf_agreement_mean": 0.38222222222222224,
+    "dpo_uf_agreement_std": 0.0015713484026367824,
+    "ggdpo_uf_agreement_mean": 0.38222222222222224,
+    "ggdpo_uf_agreement_std": 0.0015713484026367824,
+    "reward_improvement": 0.034492594401041465,
+    "uf_agreement_improvement": 0.0
+  },
+  {
+    "K": 2,
+    "N": 4,
+    "max_pairs": 6,
+    "dpo_reward_mean": 1.49575927734375,
+    "dpo_reward_std": 0.15296347161220555,
+    "ggdpo_reward_mean": 1.5960282389322915,
+    "ggdpo_reward_std": 0.16777919030333938,
+    "dpo_uf_agreement_mean": 0.38333333333333336,
+    "dpo_uf_agreement_std": 0.0,
+    "ggdpo_uf_agreement_mean": 0.38333333333333336,
+    "ggdpo_uf_agreement_std": 0.0,
+    "reward_improvement": 0.10026896158854148,
+    "uf_agreement_improvement": 0.0
+  },
+  {
+    "K": 3,
+    "N": 4,
+    "max_pairs": 6,
+    "dpo_reward_mean": 1.709567565917969,
+    "dpo_reward_std": 0.18320056119963782,
+    "ggdpo_reward_mean": 1.6879986572265624,
+    "ggdpo_reward_std": 0.25093268097436283,
+    "dpo_uf_agreement_mean": 0.38000000000000006,
+    "dpo_uf_agreement_std": 5.551115123125783e-17,
+    "ggdpo_uf_agreement_mean": 0.38222222222222224,
+    "ggdpo_uf_agreement_std": 0.0015713484026367824,
+    "reward_improvement": -0.021568908691406596,
+    "uf_agreement_improvement": 0.002222222222222181
+  },
+  {
+    "K": 6,
+    "N": 4,
+    "max_pairs": 6,
+    "dpo_reward_mean": 1.4541764322916666,
+    "dpo_reward_std": 0.09345809465735841,
+    "ggdpo_reward_mean": 1.6908813476562499,
+    "ggdpo_reward_std": 0.07772793391393676,
+    "dpo_uf_agreement_mean": 0.38222222222222224,
+    "dpo_uf_agreement_std": 0.004157397096415497,
+    "ggdpo_uf_agreement_mean": 0.38333333333333336,
+    "ggdpo_uf_agreement_std": 0.0,
+    "reward_improvement": 0.23670491536458327,
+    "uf_agreement_improvement": 0.0011111111111111183
+  }
+]

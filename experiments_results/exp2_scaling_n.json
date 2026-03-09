@@ -1,0 +1,80 @@
+[
+  {
+    "N": 5,
+    "K": 10,
+    "max_pairs": 10,
+    "dpo_agreement_mean": 1.0,
+    "dpo_agreement_std": 0.0,
+    "ggdpo_agreement_mean": 1.0,
+    "ggdpo_agreement_std": 0.0,
+    "full_dpo_agreement_mean": 1.0,
+    "full_dpo_agreement_std": 0.0,
+    "improvement_over_dpo": 0.0,
+    "gap_to_full": 0.0
+  },
+  {
+    "N": 10,
+    "K": 20,
+    "max_pairs": 45,
+    "dpo_agreement_mean": 0.9266666666666665,
+    "dpo_agreement_std": 0.03981438414926426,
+    "ggdpo_agreement_mean": 0.9244444444444444,
+    "ggdpo_agreement_std": 0.033259176771323916,
+    "full_dpo_agreement_mean": 1.0,
+    "full_dpo_agreement_std": 0.0,
+    "improvement_over_dpo": -0.0022222222222221255,
+    "gap_to_full": 0.0755555555555556
+  },
+  {
+    "N": 15,
+    "K": 30,
+    "max_pairs": 105,
+    "dpo_agreement_mean": 0.8676190476190477,
+    "dpo_agreement_std": 0.02775009958920661,
+    "ggdpo_agreement_mean": 0.8609523809523811,
+    "ggdpo_agreement_std": 0.0395438847467175,
+    "full_dpo_agreement_mean": 0.9923809523809524,
+    "full_dpo_agreement_std": 0.0071269664509979935,
+    "improvement_over_dpo": -0.006666666666666599,
+    "gap_to_full": 0.13142857142857123
+  },
+  {
+    "N": 20,
+    "K": 40,
+    "max_pairs": 190,
+    "dpo_agreement_mean": 0.8631578947368421,
+    "dpo_agreement_std": 0.023654952688678132,
+    "ggdpo_agreement_mean": 0.8642105263157894,
+    "ggdpo_agreement_std": 0.028421052631578958,
+    "full_dpo_agreement_mean": 0.9810526315789472,
+    "full_dpo_agreement_std": 0.0071392947190792025,
+    "improvement_over_dpo": 0.001052631578947305,
+    "gap_to_full": 0.11684210526315775
+  },
+  {
+    "N": 30,
+    "K": 60,
+    "max_pairs": 435,
+    "dpo_agreement_mean": 0.8570114942528736,
+    "dpo_agreement_std": 0.03373597485580532,
+    "ggdpo_agreement_mean": 0.8597701149425288,
+    "ggdpo_agreement_std": 0.036275250202435626,
+    "full_dpo_agreement_mean": 0.9652873563218389,
+    "full_dpo_agreement_std": 0.01796783726866126,
+    "improvement_over_dpo": 0.0027586206896551557,
+    "gap_to_full": 0.10551724137931018
+  },
+  {
+    "N": 50,
+    "K": 100,
+    "max_pairs": 1225,
+    "dpo_agreement_mean": 0.8277551020408163,
+    "dpo_agreement_std": 0.017810142227976663,
+    "ggdpo_agreement_mean": 0.8279183673469387,
+    "ggdpo_agreement_std": 0.029400904087848057,
+    "full_dpo_agreement_mean": 0.9533877551020409,
+    "full_dpo_agreement_std": 0.01498331711449224,
+    "improvement_over_dpo": 0.00016326530612242873,
+    "gap_to_full": 0.1254693877551022
+  }
+]
