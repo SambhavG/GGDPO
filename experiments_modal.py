@@ -14,6 +14,7 @@ Usage:
     modal run experiments_modal.py::exp7_noisy_oracle
     modal run experiments_modal.py::exp8_heldout_prediction
     modal run experiments_modal.py::exp9_convergence_speed
+    modal run experiments_modal.py::exp10_trajectory_pca
 """
 
 import modal
@@ -34,6 +35,7 @@ image = (
         "datasets",
         "accelerate",
         "peft",
+        "scikit-learn",
     )
 )
 
@@ -2577,3 +2579,565 @@ def exp9_convergence_speed():
               f"{f'{s70:.2f}' if s70 else 'N/A':>5} "
               f"{f'{s75:.2f}' if s75 else 'N/A':>5} "
               f"{f'{s80:.2f}' if s80 else 'N/A':>5}")
+
+
+# ============================================================
+# Experiment 10: Trajectory PCA - Optimization Path Visualization
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp10_trajectory_pca():
+    """
+    Visualise DPO vs GGDPO optimisation trajectories in weight space.
+
+    For each training step we record the *delta* of model parameters from
+    the reference model (policy - ref).  We subsample parameters (every
+    100th) so the full trajectory fits in memory, then run PCA across
+    both methods' combined deltas to find the top-2 principal components.
+    Plotting in this 2D space reveals whether GGDPO takes a smoother,
+    more direct path to the same destination than DPO.
+
+    Configs: representative N/K combos with multiple runs per config.
+    For each config we overlay multiple run trajectories.  We also
+    compute quantitative smoothness metrics:
+      - path length  (sum of consecutive Euclidean distances in PC space)
+      - curvature    (mean |angle change| between consecutive segments)
+      - directness   (straight-line distance / path length)
+    """
+    import copy
+    import random
+    import string
+    import json
+    import os
+    import time
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    device = "cuda"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    h = _ggdpo_helpers()
+
+    # ---- Configuration ----
+    CONFIGS = [
+        # (N, k_mult) -- chosen to span low-to-high expansion
+        (10, 1.0),   # expansion = 4.5x
+        (15, 1.0),   # expansion = 7.0x
+        (20, 1.0),   # expansion = 9.5x
+        (15, 2.0),   # expansion = 3.5x  (more oracle data)
+        (20, 2.0),   # expansion = 4.8x
+        (30, 1.0),   # expansion = 14.5x (highest expansion)
+    ]
+    NUM_RUNS = 10          # trajectories per config
+    EPOCHS = 300
+    LR = 1e-5
+    BETA = 0.1
+    SUBSAMPLE = 100        # keep every 100th parameter
+    BASE_SEED = 10101
+
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    base_model = GPT2LMHeadModel.from_pretrained(model_name)
+    base_model.config.use_cache = False
+    base_model = base_model.to(device).eval()
+
+    # Flatten reference params once (subsampled)
+    ref_flat = torch.cat(
+        [p.detach().view(-1) for p in base_model.parameters()])
+    ref_sub = ref_flat[::SUBSAMPLE].cpu().numpy()
+    param_dim = len(ref_sub)
+    print(f"Subsampled parameter dimension: {param_dim} "
+          f"(full: {len(ref_flat)}, subsample: 1/{SUBSAMPLE})")
+
+    def snapshot_delta(model):
+        """Return subsampled (policy - ref) parameter vector."""
+        flat = torch.cat(
+            [p.detach().view(-1) for p in model.parameters()])
+        delta = flat[::SUBSAMPLE].cpu().numpy() - ref_sub
+        return delta.astype(np.float32)
+
+    def train_dpo_with_trajectory(policy_model, ref_log_probs, ids, mask,
+                                  pairs, oracle_scores, epochs, lr, beta):
+        """Train DPO and record parameter delta + agreement every step."""
+        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+        winners = torch.tensor(
+            [w for w, _ in pairs], dtype=torch.long, device=device)
+        losers = torch.tensor(
+            [l for _, l in pairs], dtype=torch.long, device=device)
+        scaler = torch.amp.GradScaler("cuda")
+
+        deltas = [snapshot_delta(policy_model)]  # step 0
+        agreements = []
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            with torch.amp.autocast("cuda"):
+                policy_lp = h["get_log_prob_sums"](
+                    policy_model, ids, mask)
+                policy_w = policy_lp[winners]
+                policy_l = policy_lp[losers]
+                ref_w = ref_log_probs[winners]
+                ref_l = ref_log_probs[losers]
+                dpo_logits = beta * (
+                    (policy_w - ref_w) - (policy_l - ref_l))
+                loss = -nn.functional.logsigmoid(dpo_logits).mean()
+
+            scores = policy_lp.detach().float().cpu().numpy()
+            agree, total = h["count_pair_agreements"](
+                scores, oracle_scores)
+            agreements.append(agree / total if total > 0 else 0.0)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            deltas.append(snapshot_delta(policy_model))
+
+        # final agreement
+        with torch.no_grad():
+            with torch.amp.autocast("cuda"):
+                final_lp = h["get_log_prob_sums"](
+                    policy_model, ids, mask)
+        final_scores = final_lp.detach().float().cpu().numpy()
+        agree, total = h["count_pair_agreements"](
+            final_scores, oracle_scores)
+        agreements.append(agree / total if total > 0 else 0.0)
+
+        return np.array(deltas), agreements  # deltas: (epochs+1, dim)
+
+    def path_metrics_2d(traj_2d):
+        """Compute path length, mean curvature, directness in 2D."""
+        diffs = np.diff(traj_2d, axis=0)
+        seg_lens = np.linalg.norm(diffs, axis=1)
+        path_length = float(seg_lens.sum())
+        straight = float(np.linalg.norm(traj_2d[-1] - traj_2d[0]))
+        directness = (straight / path_length
+                      if path_length > 1e-12 else 1.0)
+
+        angles = []
+        for i in range(len(diffs) - 1):
+            d1, d2 = diffs[i], diffs[i + 1]
+            n1, n2 = np.linalg.norm(d1), np.linalg.norm(d2)
+            if n1 < 1e-12 or n2 < 1e-12:
+                continue
+            cos_a = np.clip(np.dot(d1, d2) / (n1 * n2), -1.0, 1.0)
+            angles.append(float(np.arccos(cos_a)))
+        mean_curv = float(np.mean(angles)) if angles else 0.0
+
+        return {
+            "path_length": path_length,
+            "directness": directness,
+            "mean_curvature_rad": mean_curv,
+            "mean_curvature_deg": float(np.degrees(mean_curv)),
+        }
+
+    def _mean_std(vals):
+        return float(np.mean(vals)), float(np.std(vals))
+
+    # ---- Main loop (accumulate everything for both metrics & plots) --
+    all_results = []
+    all_plot_data = []   # stored per-config for plotting
+    start_time = time.time()
+
+    for cfg_idx, (N, k_mult) in enumerate(CONFIGS):
+        max_pairs = N * (N - 1) // 2
+        K = min(max(int(k_mult * N), N - 1), max_pairs)
+        expansion = max_pairs / K
+
+        print(f"\n{'='*70}")
+        print(f"Config {cfg_idx+1}/{len(CONFIGS)}: N={N}, K={K} "
+              f"(x{k_mult}), C(N,2)={max_pairs}, "
+              f"expansion={expansion:.1f}x")
+        print(f"{'='*70}")
+
+        dpo_trajectories = []
+        ggdpo_trajectories = []
+        dpo_agreements_all = []
+        ggdpo_agreements_all = []
+
+        for run_idx in range(NUM_RUNS):
+            seed = (BASE_SEED + run_idx
+                    + N * 1000 + int(k_mult * 100))
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+
+            prompt = "".join(random.choices(
+                string.ascii_letters + string.digits, k=20))
+
+            pi_dpo = copy.deepcopy(base_model).train()
+            pi_ggdpo = copy.deepcopy(base_model).train()
+
+            inputs = tokenizer(
+                prompt, return_tensors="pt").to(device)
+            completions = []
+            with torch.no_grad():
+                for _ in range(N):
+                    out = base_model.generate(
+                        **{kk: v.clone()
+                           for kk, v in inputs.items()},
+                        max_new_tokens=15, do_sample=True,
+                        top_k=50,
+                        pad_token_id=tokenizer.eos_token_id)
+                    completions.append(tokenizer.decode(
+                        out[0], skip_special_tokens=True))
+
+            # Deduplicate
+            unique = list(set(completions))
+            retries = 0
+            while len(unique) < N and retries < N * 3:
+                out = base_model.generate(
+                    **{kk: v.clone()
+                       for kk, v in inputs.items()},
+                    max_new_tokens=15, do_sample=True,
+                    top_k=50, temperature=1.2,
+                    pad_token_id=tokenizer.eos_token_id)
+                c = tokenizer.decode(
+                    out[0], skip_special_tokens=True)
+                if c not in unique:
+                    unique.append(c)
+                retries += 1
+            completions = unique[:N]
+            if len(completions) < N:
+                while len(completions) < N:
+                    completions.append(
+                        completions[len(completions) % len(unique)])
+
+            perm = np.random.permutation(N)
+            oracle_scores = np.empty(N)
+            for rank, idx in enumerate(perm):
+                oracle_scores[idx] = rank + 1
+
+            sampled_pairs = h["sample_pairs_random"](N, K)
+            labeled_pairs = h["label_pairs"](
+                sampled_pairs, oracle_scores)
+            bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+            full_graph = h["construct_full_graph"](bt_scores)
+
+            tokens = tokenizer(
+                completions, return_tensors="pt",
+                padding=True, truncation=True)
+            ids = tokens["input_ids"].to(device)
+            mask = tokens["attention_mask"].to(device)
+
+            with torch.no_grad():
+                ref_lp = h["get_log_prob_sums"](
+                    base_model, ids, mask)
+
+            dpo_deltas, dpo_agree = train_dpo_with_trajectory(
+                pi_dpo, ref_lp, ids, mask, labeled_pairs,
+                oracle_scores, EPOCHS, LR, BETA)
+            ggdpo_deltas, ggdpo_agree = train_dpo_with_trajectory(
+                pi_ggdpo, ref_lp, ids, mask, full_graph,
+                oracle_scores, EPOCHS, LR, BETA)
+
+            dpo_trajectories.append(dpo_deltas)
+            ggdpo_trajectories.append(ggdpo_deltas)
+            dpo_agreements_all.append(dpo_agree)
+            ggdpo_agreements_all.append(ggdpo_agree)
+
+            del pi_dpo, pi_ggdpo
+            torch.cuda.empty_cache()
+
+            if (run_idx + 1) % 2 == 0:
+                elapsed = time.time() - start_time
+                print(f"  Run {run_idx+1}/{NUM_RUNS} "
+                      f"({elapsed:.0f}s)")
+
+        # ---- PCA across all runs for this config ----
+        all_deltas = np.concatenate(
+            dpo_trajectories + ggdpo_trajectories, axis=0)
+        pca = PCA(n_components=2)
+        all_2d = pca.fit_transform(all_deltas)
+        var_explained = pca.explained_variance_ratio_
+
+        T_per_run = dpo_trajectories[0].shape[0]
+        n_per_method = NUM_RUNS * T_per_run
+        dpo_2d_all = all_2d[:n_per_method].reshape(
+            NUM_RUNS, T_per_run, 2)
+        ggdpo_2d_all = all_2d[n_per_method:].reshape(
+            NUM_RUNS, T_per_run, 2)
+
+        # Store for plotting later (lightweight: ~144 KB per config)
+        all_plot_data.append({
+            "dpo_2d": dpo_2d_all,
+            "ggdpo_2d": ggdpo_2d_all,
+            "var_explained": var_explained,
+        })
+
+        # Compute per-run path metrics
+        dpo_metrics = [path_metrics_2d(dpo_2d_all[r])
+                       for r in range(NUM_RUNS)]
+        ggdpo_metrics = [path_metrics_2d(ggdpo_2d_all[r])
+                         for r in range(NUM_RUNS)]
+
+        dpo_pl_m, dpo_pl_s = _mean_std(
+            [m["path_length"] for m in dpo_metrics])
+        ggdpo_pl_m, ggdpo_pl_s = _mean_std(
+            [m["path_length"] for m in ggdpo_metrics])
+        dpo_dir_m, dpo_dir_s = _mean_std(
+            [m["directness"] for m in dpo_metrics])
+        ggdpo_dir_m, ggdpo_dir_s = _mean_std(
+            [m["directness"] for m in ggdpo_metrics])
+        dpo_curv_m, dpo_curv_s = _mean_std(
+            [m["mean_curvature_deg"] for m in dpo_metrics])
+        ggdpo_curv_m, ggdpo_curv_s = _mean_std(
+            [m["mean_curvature_deg"] for m in ggdpo_metrics])
+
+        result = {
+            "N": N, "K": K, "k_mult": k_mult,
+            "max_pairs": max_pairs,
+            "expansion_factor": expansion,
+            "pca_var_explained": var_explained.tolist(),
+            "dpo_path_length_mean": dpo_pl_m,
+            "dpo_path_length_std": dpo_pl_s,
+            "ggdpo_path_length_mean": ggdpo_pl_m,
+            "ggdpo_path_length_std": ggdpo_pl_s,
+            "dpo_directness_mean": dpo_dir_m,
+            "dpo_directness_std": dpo_dir_s,
+            "ggdpo_directness_mean": ggdpo_dir_m,
+            "ggdpo_directness_std": ggdpo_dir_s,
+            "dpo_curvature_deg_mean": dpo_curv_m,
+            "dpo_curvature_deg_std": dpo_curv_s,
+            "ggdpo_curvature_deg_mean": ggdpo_curv_m,
+            "ggdpo_curvature_deg_std": ggdpo_curv_s,
+            "dpo_final_agreement_mean": float(np.mean(
+                [a[-1] for a in dpo_agreements_all])),
+            "ggdpo_final_agreement_mean": float(np.mean(
+                [a[-1] for a in ggdpo_agreements_all])),
+            "dpo_mean_trajectory": dpo_2d_all.mean(
+                axis=0).tolist(),
+            "ggdpo_mean_trajectory": ggdpo_2d_all.mean(
+                axis=0).tolist(),
+        }
+        all_results.append(result)
+
+        print(f"  PCA var: PC1={var_explained[0]:.3f}, "
+              f"PC2={var_explained[1]:.3f}")
+        print(f"  Path len:  DPO={dpo_pl_m:.4f}+/-{dpo_pl_s:.4f}  "
+              f"GGDPO={ggdpo_pl_m:.4f}+/-{ggdpo_pl_s:.4f}")
+        print(f"  Directness: DPO={dpo_dir_m:.4f}+/-{dpo_dir_s:.4f}"
+              f"  GGDPO={ggdpo_dir_m:.4f}+/-{ggdpo_dir_s:.4f}")
+        print(f"  Curvature:  DPO={dpo_curv_m:.1f}+/-{dpo_curv_s:.1f}"
+              f"  GGDPO={ggdpo_curv_m:.1f}+/-{ggdpo_curv_s:.1f}")
+
+        # Free high-dim trajectories after PCA
+        del dpo_trajectories, ggdpo_trajectories, all_deltas
+        torch.cuda.empty_cache()
+
+    # ================================================================
+    # Save JSON
+    # ================================================================
+    with open(os.path.join(RESULTS_DIR,
+              "exp10_trajectory_pca.json"), "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nResults saved to {RESULTS_DIR}/exp10_trajectory_pca.json")
+
+    # ================================================================
+    # PLOT 1: 2x3 grid of trajectory plots (one per config)
+    # ================================================================
+    print("\n--- Generating trajectory plots ---")
+    fig, axes = plt.subplots(2, 3, figsize=(20, 13))
+    axes_flat = axes.flatten()
+
+    config_labels = []
+    dpo_directness_vals = []
+    ggdpo_directness_vals = []
+    dpo_curvature_vals = []
+    ggdpo_curvature_vals = []
+    dpo_pathlength_vals = []
+    ggdpo_pathlength_vals = []
+
+    for cfg_idx, (N, k_mult) in enumerate(CONFIGS):
+        max_pairs = N * (N - 1) // 2
+        K = min(max(int(k_mult * N), N - 1), max_pairs)
+        expansion = max_pairs / K
+
+        pd = all_plot_data[cfg_idx]
+        dpo_2d = pd["dpo_2d"]       # (NUM_RUNS, T, 2)
+        ggdpo_2d = pd["ggdpo_2d"]   # (NUM_RUNS, T, 2)
+        var_exp = pd["var_explained"]
+
+        ax = axes_flat[cfg_idx]
+        plot_runs = min(NUM_RUNS, 5)
+
+        # Individual runs (thin, semi-transparent)
+        for r in range(plot_runs):
+            ax.plot(dpo_2d[r, :, 0], dpo_2d[r, :, 1],
+                    color='tab:blue', alpha=0.2, linewidth=0.5)
+            ax.plot(ggdpo_2d[r, :, 0], ggdpo_2d[r, :, 1],
+                    color='tab:orange', alpha=0.2, linewidth=0.5)
+
+        # Mean trajectory (thick)
+        dpo_mean = dpo_2d.mean(axis=0)
+        ggdpo_mean = ggdpo_2d.mean(axis=0)
+        ax.plot(dpo_mean[:, 0], dpo_mean[:, 1],
+                color='tab:blue', linewidth=2.0,
+                label='DPO (mean)')
+        ax.plot(ggdpo_mean[:, 0], ggdpo_mean[:, 1],
+                color='tab:orange', linewidth=2.0,
+                label='GGDPO (mean)')
+
+        # Start and end markers
+        ax.scatter(*dpo_mean[0], color='tab:blue', s=80,
+                   marker='o', zorder=5, edgecolors='black',
+                   linewidths=0.8)
+        ax.scatter(*dpo_mean[-1], color='tab:blue', s=120,
+                   marker='*', zorder=5, edgecolors='black',
+                   linewidths=0.8)
+        ax.scatter(*ggdpo_mean[0], color='tab:orange', s=80,
+                   marker='o', zorder=5, edgecolors='black',
+                   linewidths=0.8)
+        ax.scatter(*ggdpo_mean[-1], color='tab:orange', s=120,
+                   marker='*', zorder=5, edgecolors='black',
+                   linewidths=0.8)
+
+        # Directional arrows at key steps
+        for s in [50, 100, 150, 200, 250]:
+            if s < len(dpo_mean) - 1:
+                ax.annotate(
+                    '', xy=dpo_mean[s+1], xytext=dpo_mean[s],
+                    arrowprops=dict(arrowstyle='->',
+                                    color='tab:blue',
+                                    lw=1.5, mutation_scale=10))
+                ax.annotate(
+                    '', xy=ggdpo_mean[s+1],
+                    xytext=ggdpo_mean[s],
+                    arrowprops=dict(arrowstyle='->',
+                                    color='tab:orange',
+                                    lw=1.5, mutation_scale=10))
+
+        # Per-run metrics for this config
+        cfg_dpo_m = [path_metrics_2d(dpo_2d[r])
+                     for r in range(plot_runs)]
+        cfg_ggdpo_m = [path_metrics_2d(ggdpo_2d[r])
+                       for r in range(plot_runs)]
+
+        dpo_dir = np.mean(
+            [m["directness"] for m in cfg_dpo_m])
+        ggdpo_dir = np.mean(
+            [m["directness"] for m in cfg_ggdpo_m])
+        dpo_curv = np.mean(
+            [m["mean_curvature_deg"] for m in cfg_dpo_m])
+        ggdpo_curv = np.mean(
+            [m["mean_curvature_deg"] for m in cfg_ggdpo_m])
+        dpo_pl = np.mean(
+            [m["path_length"] for m in cfg_dpo_m])
+        ggdpo_pl = np.mean(
+            [m["path_length"] for m in cfg_ggdpo_m])
+
+        label = (f"N={N}, K={K}\n"
+                 f"({k_mult}x, exp={expansion:.1f}x)")
+        config_labels.append(f"N={N}\nK={K}")
+        dpo_directness_vals.append(dpo_dir)
+        ggdpo_directness_vals.append(ggdpo_dir)
+        dpo_curvature_vals.append(dpo_curv)
+        ggdpo_curvature_vals.append(ggdpo_curv)
+        dpo_pathlength_vals.append(dpo_pl)
+        ggdpo_pathlength_vals.append(ggdpo_pl)
+
+        ax.set_title(
+            f"{label}\nDir: DPO={dpo_dir:.3f} "
+            f"GGDPO={ggdpo_dir:.3f}",
+            fontsize=9)
+        ax.set_xlabel(
+            f"PC1 ({var_exp[0]:.1%} var)", fontsize=8)
+        ax.set_ylabel(
+            f"PC2 ({var_exp[1]:.1%} var)", fontsize=8)
+        ax.legend(fontsize=7, loc='best')
+        ax.grid(True, alpha=0.2)
+        ax.tick_params(labelsize=7)
+
+    plt.suptitle(
+        "GGDPO vs DPO: Optimization Trajectories in "
+        "Weight Space\n"
+        "(PCA of parameter deltas from reference model, "
+        "o=start, *=end)",
+        fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR,
+                "exp10_trajectories.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+    print("Saved exp10_trajectories.png")
+
+    # ================================================================
+    # PLOT 2: Smoothness metrics comparison bar chart
+    # ================================================================
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    x = np.arange(len(config_labels))
+    w = 0.35
+
+    ax1.bar(x - w/2, dpo_directness_vals, w,
+            label='DPO', color='tab:blue', alpha=0.8)
+    ax1.bar(x + w/2, ggdpo_directness_vals, w,
+            label='GGDPO', color='tab:orange', alpha=0.8)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(config_labels, fontsize=8)
+    ax1.set_ylabel("Directness (straight/path)")
+    ax1.set_title("Path Directness\n(higher = more direct)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    ax2.bar(x - w/2, dpo_curvature_vals, w,
+            label='DPO', color='tab:blue', alpha=0.8)
+    ax2.bar(x + w/2, ggdpo_curvature_vals, w,
+            label='GGDPO', color='tab:orange', alpha=0.8)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(config_labels, fontsize=8)
+    ax2.set_ylabel("Mean Curvature (degrees)")
+    ax2.set_title("Path Curvature\n(lower = smoother)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    ax3.bar(x - w/2, dpo_pathlength_vals, w,
+            label='DPO', color='tab:blue', alpha=0.8)
+    ax3.bar(x + w/2, ggdpo_pathlength_vals, w,
+            label='GGDPO', color='tab:orange', alpha=0.8)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(config_labels, fontsize=8)
+    ax3.set_ylabel("Path Length (L2 in PC space)")
+    ax3.set_title("Total Path Length\n(shorter = more efficient)")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+
+    plt.suptitle("GGDPO vs DPO: Trajectory Smoothness Metrics",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR,
+                "exp10_smoothness.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+    print("Saved exp10_smoothness.png")
+
+    results_vol.commit()
+
+    total_time = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"EXPERIMENT 10 COMPLETE in {total_time:.0f}s "
+          f"({total_time/60:.1f}min)")
+    print(f"{'='*70}")
+
+    # Summary table
+    print(f"\n{'Config':<20} | {'DPO Dir':>8} {'GGDPO Dir':>10} | "
+          f"{'DPO Curv':>9} {'GGDPO Curv':>11} | "
+          f"{'DPO PL':>8} {'GGDPO PL':>10}")
+    print("-" * 95)
+    for r in all_results:
+        lbl = f"N={r['N']},K={r['K']}({r['k_mult']}x)"
+        print(f"{lbl:<20} | "
+              f"{r['dpo_directness_mean']:>8.4f} "
+              f"{r['ggdpo_directness_mean']:>10.4f} | "
+              f"{r['dpo_curvature_deg_mean']:>9.1f} "
+              f"{r['ggdpo_curvature_deg_mean']:>11.1f} | "
+              f"{r['dpo_path_length_mean']:>8.4f} "
+              f"{r['ggdpo_path_length_mean']:>10.4f}")
