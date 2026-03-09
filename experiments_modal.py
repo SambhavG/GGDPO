@@ -13,6 +13,7 @@ Usage:
     modal run experiments_modal.py::exp6_gradient_variance
     modal run experiments_modal.py::exp7_noisy_oracle
     modal run experiments_modal.py::exp8_heldout_prediction
+    modal run experiments_modal.py::exp9_convergence_speed
 """
 
 import modal
@@ -2022,3 +2023,557 @@ def exp8_heldout_prediction():
     results_vol.commit()
     print("\n=== Experiment 8 Complete ===")
     print(json.dumps(results, indent=2))
+
+
+# ============================================================
+# Experiment 9: Large-Scale Convergence Speed
+# ============================================================
+
+@app.function(**COMMON_KWARGS)
+def exp9_convergence_speed():
+    """
+    Large-scale convergence speed experiment testing GGDPO's step quality.
+
+    Core hypothesis: GGDPO takes better gradient steps than DPO because each
+    step uses all C(N,2) inferred preference pairs instead of only K oracle pairs.
+    Both methods train with identical hyperparameters (same lr, same optimizer,
+    same number of epochs). GGDPO should converge to the correct preference
+    distribution faster (fewer steps to reach same agreement level).
+
+    Both methods should reach similar final equilibrium since they're doing the
+    same thing — GGDPO just takes more informed steps while DPO takes noisier,
+    less directed steps. The advantage is convergence speed, not final quality.
+
+    Grid: N in {5, 8, 10, 15, 20, 25, 30} x K_mult in {1.0, 1.5, 2.0, 3.0}
+    20 runs per config, 300 epochs each. Agreement tracked at every step.
+    """
+    import copy
+    import random
+    import string
+    import json
+    import os
+    import time
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    device = "cuda"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    h = _ggdpo_helpers()
+
+    # ---- Configuration ----
+    N_VALUES = [5, 8, 10, 15, 20, 25, 30]
+    K_MULTIPLIERS = [1.0, 1.5, 2.0, 3.0]
+    NUM_RUNS = 20
+    EPOCHS = 300
+    LR = 1e-5
+    BETA = 0.1
+    THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+    BASE_SEED = 9999
+
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    # Load base model once (reused via deepcopy for each run)
+    base_model = GPT2LMHeadModel.from_pretrained(model_name)
+    base_model.config.use_cache = False
+    base_model = base_model.to(device).eval()
+
+    def train_dpo_tracked(policy_model, ref_log_probs, ids, mask, pairs,
+                          oracle_scores, epochs=300, lr=1e-5, beta=0.1):
+        """Train DPO and record agreement with ground truth at every step.
+
+        Returns:
+            agreements: list of length epochs+1 (pre-step for each epoch + final post-step)
+            losses: list of length epochs
+        """
+        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+        winners = torch.tensor([w for w, _ in pairs], dtype=torch.long, device=device)
+        losers = torch.tensor([l for _, l in pairs], dtype=torch.long, device=device)
+
+        agreements = []
+        losses_list = []
+        scaler = torch.amp.GradScaler("cuda")
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            with torch.amp.autocast("cuda"):
+                policy_log_probs = h["get_log_prob_sums"](policy_model, ids, mask)
+                policy_w = policy_log_probs[winners]
+                policy_l = policy_log_probs[losers]
+                ref_w = ref_log_probs[winners]
+                ref_l = ref_log_probs[losers]
+                dpo_logits = beta * ((policy_w - ref_w) - (policy_l - ref_l))
+                loss_val = -nn.functional.logsigmoid(dpo_logits).mean()
+
+            # Record pre-step agreement (model state before this gradient step)
+            model_scores = policy_log_probs.detach().float().cpu().numpy()
+            agree, total = h["count_pair_agreements"](model_scores, oracle_scores)
+            agreements.append(agree / total if total > 0 else 0.0)
+            losses_list.append(float(loss_val.item()))
+
+            # Take gradient step
+            scaler.scale(loss_val).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        # Final post-step evaluation (state after last gradient step)
+        with torch.no_grad():
+            with torch.amp.autocast("cuda"):
+                final_lps = h["get_log_prob_sums"](policy_model, ids, mask)
+        final_scores = final_lps.detach().float().cpu().numpy()
+        agree, total = h["count_pair_agreements"](final_scores, oracle_scores)
+        agreements.append(agree / total if total > 0 else 0.0)
+
+        return agreements, losses_list
+
+    def steps_to_threshold(curves_arr, threshold):
+        """For each run curve, find first step where agreement >= threshold."""
+        n_runs, n_steps = curves_arr.shape
+        steps = []
+        for i in range(n_runs):
+            found = False
+            for t in range(n_steps):
+                if curves_arr[i, t] >= threshold:
+                    steps.append(t)
+                    found = True
+                    break
+            if not found:
+                steps.append(n_steps)  # never reached
+        return np.array(steps)
+
+    # ---- Main experiment loop ----
+    all_results = []
+    total_configs = len(N_VALUES) * len(K_MULTIPLIERS)
+    config_idx = 0
+    start_time = time.time()
+
+    for N in N_VALUES:
+        max_pairs = N * (N - 1) // 2
+        for k_mult in K_MULTIPLIERS:
+            K = min(max(int(k_mult * N), N - 1), max_pairs)
+            config_idx += 1
+
+            print(f"\n{'='*70}")
+            print(f"Config {config_idx}/{total_configs}: N={N}, K={K} (x{k_mult}), "
+                  f"C(N,2)={max_pairs}, expansion={max_pairs/K:.1f}x")
+            print(f"{'='*70}")
+
+            dpo_all_curves = []
+            ggdpo_all_curves = []
+            dpo_all_losses = []
+            ggdpo_all_losses = []
+
+            config_start = time.time()
+
+            for run_idx in range(NUM_RUNS):
+                seed = BASE_SEED + run_idx + N * 1000 + int(k_mult * 100)
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                random.seed(seed)
+
+                prompt = "".join(random.choices(string.ascii_letters + string.digits, k=20))
+
+                pi_dpo = copy.deepcopy(base_model).train()
+                pi_ggdpo = copy.deepcopy(base_model).train()
+
+                # Generate N completions from the base model
+                inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                completions = []
+                with torch.no_grad():
+                    for _ in range(N):
+                        out = base_model.generate(
+                            **{kk: v.clone() for kk, v in inputs.items()},
+                            max_new_tokens=15, do_sample=True, top_k=50,
+                            pad_token_id=tokenizer.eos_token_id
+                        )
+                        completions.append(tokenizer.decode(out[0], skip_special_tokens=True))
+
+                # Deduplicate completions - if we get duplicates, regenerate
+                unique_completions = list(set(completions))
+                retries = 0
+                while len(unique_completions) < N and retries < N * 3:
+                    out = base_model.generate(
+                        **{kk: v.clone() for kk, v in inputs.items()},
+                        max_new_tokens=15, do_sample=True, top_k=50,
+                        temperature=1.2,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    c = tokenizer.decode(out[0], skip_special_tokens=True)
+                    if c not in unique_completions:
+                        unique_completions.append(c)
+                    retries += 1
+                completions = unique_completions[:N]
+                if len(completions) < N:
+                    print(f"  Warning: only got {len(completions)} unique completions for N={N}, padding with duplicates")
+                    while len(completions) < N:
+                        completions.append(completions[len(completions) % len(unique_completions)])
+
+                # Random ground truth ordering
+                perm = np.random.permutation(N)
+                oracle_scores = np.empty(N)
+                for rank, idx in enumerate(perm):
+                    oracle_scores[idx] = rank + 1
+
+                # Sample K oracle pairs with coverage constraint, label them
+                sampled_pairs = h["sample_pairs_random"](N, K)
+                labeled_pairs = h["label_pairs"](sampled_pairs, oracle_scores)
+
+                # Fit BT scores and expand to full graph
+                bt_scores = h["fit_bradley_terry"](N, labeled_pairs)
+                full_graph = h["construct_full_graph"](bt_scores)
+
+                # Tokenize completions
+                tokens = tokenizer(completions, return_tensors="pt", padding=True, truncation=True)
+                ids = tokens["input_ids"].to(device)
+                mask = tokens["attention_mask"].to(device)
+
+                # Reference log probs (frozen base model)
+                with torch.no_grad():
+                    ref_lp = h["get_log_prob_sums"](base_model, ids, mask)
+
+                # Train both methods with identical hyperparameters
+                dpo_agree, dpo_loss = train_dpo_tracked(
+                    pi_dpo, ref_lp, ids, mask, labeled_pairs,
+                    oracle_scores, EPOCHS, LR, BETA)
+                ggdpo_agree, ggdpo_loss = train_dpo_tracked(
+                    pi_ggdpo, ref_lp, ids, mask, full_graph,
+                    oracle_scores, EPOCHS, LR, BETA)
+
+                dpo_all_curves.append(dpo_agree)
+                ggdpo_all_curves.append(ggdpo_agree)
+                dpo_all_losses.append(dpo_loss)
+                ggdpo_all_losses.append(ggdpo_loss)
+
+                del pi_dpo, pi_ggdpo
+                torch.cuda.empty_cache()
+
+                if (run_idx + 1) % 5 == 0:
+                    elapsed = time.time() - config_start
+                    print(f"  Run {run_idx+1}/{NUM_RUNS} ({elapsed:.0f}s): "
+                          f"DPO final={dpo_agree[-1]:.3f} GGDPO final={ggdpo_agree[-1]:.3f}")
+
+            # Aggregate curves
+            dpo_arr = np.array(dpo_all_curves)       # (NUM_RUNS, EPOCHS+1)
+            ggdpo_arr = np.array(ggdpo_all_curves)   # (NUM_RUNS, EPOCHS+1)
+            dpo_loss_arr = np.array(dpo_all_losses)   # (NUM_RUNS, EPOCHS)
+            ggdpo_loss_arr = np.array(ggdpo_all_losses)
+
+            # AUC of agreement curve (higher = faster convergence + higher final)
+            # Use np.trapezoid (numpy 2.0+) with np.trapz fallback
+            _trapz = getattr(np, 'trapezoid', None) or np.trapz
+            dpo_auc_per_run = _trapz(dpo_arr, axis=1) / EPOCHS
+            ggdpo_auc_per_run = _trapz(ggdpo_arr, axis=1) / EPOCHS
+
+            # Steps to threshold for each threshold
+            threshold_data = {}
+            for t in THRESHOLDS:
+                dpo_steps = steps_to_threshold(dpo_arr, t)
+                ggdpo_steps = steps_to_threshold(ggdpo_arr, t)
+                dpo_reached = int(np.sum(dpo_steps < EPOCHS + 1))
+                ggdpo_reached = int(np.sum(ggdpo_steps < EPOCHS + 1))
+
+                # Only compute speedup if enough runs reach threshold
+                if ggdpo_reached >= NUM_RUNS // 2 and dpo_reached >= NUM_RUNS // 2:
+                    dpo_median = float(np.median(dpo_steps[dpo_steps < EPOCHS + 1]))
+                    ggdpo_median = float(np.median(ggdpo_steps[ggdpo_steps < EPOCHS + 1]))
+                    speedup = dpo_median / max(ggdpo_median, 1.0)
+                else:
+                    dpo_median = float(np.median(dpo_steps))
+                    ggdpo_median = float(np.median(ggdpo_steps))
+                    speedup = None
+
+                threshold_data[str(t)] = {
+                    "dpo_steps_mean": float(np.mean(dpo_steps)),
+                    "dpo_steps_median": dpo_median,
+                    "dpo_steps_std": float(np.std(dpo_steps)),
+                    "dpo_runs_reached": dpo_reached,
+                    "ggdpo_steps_mean": float(np.mean(ggdpo_steps)),
+                    "ggdpo_steps_median": ggdpo_median,
+                    "ggdpo_steps_std": float(np.std(ggdpo_steps)),
+                    "ggdpo_runs_reached": ggdpo_reached,
+                    "speedup_median": speedup,
+                }
+
+            result = {
+                "N": N,
+                "K": K,
+                "k_mult": k_mult,
+                "max_pairs": max_pairs,
+                "expansion_factor": float(max_pairs / K),
+                "dpo_curve_mean": dpo_arr.mean(axis=0).tolist(),
+                "dpo_curve_std": dpo_arr.std(axis=0).tolist(),
+                "ggdpo_curve_mean": ggdpo_arr.mean(axis=0).tolist(),
+                "ggdpo_curve_std": ggdpo_arr.std(axis=0).tolist(),
+                "dpo_loss_mean": dpo_loss_arr.mean(axis=0).tolist(),
+                "ggdpo_loss_mean": ggdpo_loss_arr.mean(axis=0).tolist(),
+                "dpo_final_mean": float(dpo_arr[:, -1].mean()),
+                "dpo_final_std": float(dpo_arr[:, -1].std()),
+                "ggdpo_final_mean": float(ggdpo_arr[:, -1].mean()),
+                "ggdpo_final_std": float(ggdpo_arr[:, -1].std()),
+                "dpo_auc_mean": float(dpo_auc_per_run.mean()),
+                "dpo_auc_std": float(dpo_auc_per_run.std()),
+                "ggdpo_auc_mean": float(ggdpo_auc_per_run.mean()),
+                "ggdpo_auc_std": float(ggdpo_auc_per_run.std()),
+                "thresholds": threshold_data,
+            }
+            all_results.append(result)
+
+            elapsed = time.time() - start_time
+            print(f"\n  Config {config_idx}: "
+                  f"DPO final={result['dpo_final_mean']:.3f}+/-{result['dpo_final_std']:.3f} "
+                  f"GGDPO final={result['ggdpo_final_mean']:.3f}+/-{result['ggdpo_final_std']:.3f}")
+            print(f"  AUC: DPO={result['dpo_auc_mean']:.4f} GGDPO={result['ggdpo_auc_mean']:.4f} "
+                  f"(+{result['ggdpo_auc_mean'] - result['dpo_auc_mean']:.4f})")
+            for t in [0.70, 0.75, 0.80]:
+                td = threshold_data.get(str(t))
+                if td:
+                    sp = f"{td['speedup_median']:.2f}x" if td['speedup_median'] else "N/A"
+                    print(f"  Steps to {t}: DPO={td['dpo_steps_median']:.0f} GGDPO={td['ggdpo_steps_median']:.0f} "
+                          f"Speedup={sp} ({td['dpo_runs_reached']}/{NUM_RUNS} vs {td['ggdpo_runs_reached']}/{NUM_RUNS})")
+            print(f"  Total elapsed: {elapsed:.0f}s")
+
+    # Save results
+    save_path = os.path.join(RESULTS_DIR, "exp9_convergence_speed.json")
+    with open(save_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nResults saved to {save_path}")
+
+    # ======== PLOTTING ========
+
+    # --- Plot 1: Hero convergence curves (2x3 grid) ---
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    hero_configs = [
+        (10, 1.0), (15, 1.0), (20, 1.0),
+        (15, 2.0), (20, 2.0), (30, 1.0)
+    ]
+    for ax, (tgt_N, tgt_km) in zip(axes.flat, hero_configs):
+        matched = False
+        for r in all_results:
+            if r["N"] == tgt_N and r["k_mult"] == tgt_km:
+                steps = np.arange(EPOCHS + 1)
+                dpo_m = np.array(r["dpo_curve_mean"])
+                dpo_s = np.array(r["dpo_curve_std"])
+                ggdpo_m = np.array(r["ggdpo_curve_mean"])
+                ggdpo_s = np.array(r["ggdpo_curve_std"])
+
+                ax.plot(steps, dpo_m, color='#2196F3', linewidth=1.5,
+                        label=f'DPO ({r["K"]} pairs)')
+                ax.fill_between(steps, dpo_m - dpo_s, dpo_m + dpo_s,
+                                alpha=0.15, color='#2196F3')
+                ax.plot(steps, ggdpo_m, color='#FF5722', linewidth=1.5,
+                        label=f'GGDPO ({r["max_pairs"]} pairs)')
+                ax.fill_between(steps, ggdpo_m - ggdpo_s, ggdpo_m + ggdpo_s,
+                                alpha=0.15, color='#FF5722')
+
+                for threshold in [0.70, 0.80]:
+                    ax.axhline(y=threshold, color='gray', linestyle=':', alpha=0.5)
+
+                ax.set_xlabel("Training Step", fontsize=9)
+                ax.set_ylabel("Oracle Agreement", fontsize=9)
+                ax.set_title(f"N={tgt_N}, K={r['K']} ({r['K']}/{r['max_pairs']} pairs)",
+                            fontsize=10, fontweight='bold')
+                ax.legend(fontsize=8, loc='lower right')
+                ax.grid(True, alpha=0.2)
+                ax.set_ylim(0.4, 1.0)
+                matched = True
+                break
+        if not matched:
+            ax.set_visible(False)
+
+    plt.suptitle("GGDPO vs DPO: Convergence Speed\n(shading = +/-1 std over 20 runs)",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp9_convergence_curves.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Plot 2: Speedup heatmaps for 3 thresholds ---
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    for ax_idx, threshold in enumerate([0.65, 0.70, 0.75]):
+        n_rows = len(N_VALUES)
+        n_cols = len(K_MULTIPLIERS)
+        speedup_matrix = np.full((n_rows, n_cols), np.nan)
+
+        for r in all_results:
+            ni = N_VALUES.index(r["N"])
+            ki = K_MULTIPLIERS.index(r["k_mult"])
+            td = r["thresholds"].get(str(threshold), {})
+            sp = td.get("speedup_median")
+            if sp is not None:
+                speedup_matrix[ni, ki] = sp
+
+        im = axes[ax_idx].imshow(speedup_matrix, aspect='auto', cmap='RdYlGn',
+                                  vmin=0.7, vmax=2.0, origin='lower')
+        axes[ax_idx].set_xticks(range(n_cols))
+        axes[ax_idx].set_xticklabels([f"{km}x N" for km in K_MULTIPLIERS])
+        axes[ax_idx].set_yticks(range(n_rows))
+        axes[ax_idx].set_yticklabels(N_VALUES)
+        axes[ax_idx].set_xlabel("K (oracle pairs)")
+        axes[ax_idx].set_ylabel("N (completions)")
+        axes[ax_idx].set_title(f"Speedup to {int(threshold*100)}% agreement", fontweight='bold')
+
+        for i in range(n_rows):
+            for j in range(n_cols):
+                val = speedup_matrix[i, j]
+                if not np.isnan(val):
+                    color = "white" if val > 1.5 or val < 0.8 else "black"
+                    axes[ax_idx].text(j, i, f"{val:.2f}x",
+                                      ha="center", va="center", fontsize=9, color=color,
+                                      fontweight='bold')
+                else:
+                    axes[ax_idx].text(j, i, "N/A",
+                                      ha="center", va="center", fontsize=8, color="gray")
+
+        plt.colorbar(im, ax=axes[ax_idx], shrink=0.8, label="Speedup (DPO / GGDPO steps)")
+
+    plt.suptitle("GGDPO Convergence Speedup over DPO\n(>1.0 = GGDPO converges faster)",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp9_speedup_heatmap.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Plot 3: AUC comparison + final equilibrium + early convergence ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+
+    colors_km = {1.0: '#E53935', 1.5: '#FB8C00', 2.0: '#43A047', 3.0: '#1E88E5'}
+
+    # AUC comparison
+    for k_mult in K_MULTIPLIERS:
+        Ns = []
+        dpo_aucs = []
+        ggdpo_aucs = []
+        for r in all_results:
+            if r["k_mult"] == k_mult:
+                Ns.append(r["N"])
+                dpo_aucs.append(r["dpo_auc_mean"])
+                ggdpo_aucs.append(r["ggdpo_auc_mean"])
+        c = colors_km[k_mult]
+        ax1.plot(Ns, dpo_aucs, marker='o', linestyle='--', alpha=0.4, color=c)
+        ax1.plot(Ns, ggdpo_aucs, marker='s', color=c, label=f'K={k_mult}x N')
+
+    ax1.set_xlabel("N")
+    ax1.set_ylabel("AUC (higher = faster convergence)")
+    ax1.set_title("Area Under Convergence Curve\n(solid=GGDPO, dashed=DPO)", fontweight='bold')
+    ax1.legend(fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Final equilibrium
+    for k_mult in K_MULTIPLIERS:
+        Ns = []
+        dpo_finals = []
+        ggdpo_finals = []
+        for r in all_results:
+            if r["k_mult"] == k_mult:
+                Ns.append(r["N"])
+                dpo_finals.append(r["dpo_final_mean"])
+                ggdpo_finals.append(r["ggdpo_final_mean"])
+        c = colors_km[k_mult]
+        ax2.plot(Ns, dpo_finals, marker='o', linestyle='--', alpha=0.4, color=c)
+        ax2.plot(Ns, ggdpo_finals, marker='s', color=c, label=f'K={k_mult}x N')
+
+    ax2.set_xlabel("N")
+    ax2.set_ylabel("Final Agreement (step 300)")
+    ax2.set_title("Final Equilibrium\n(solid=GGDPO, dashed=DPO)", fontweight='bold')
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    # Early convergence (step 50)
+    for k_mult in K_MULTIPLIERS:
+        Ns = []
+        dpo_early = []
+        ggdpo_early = []
+        for r in all_results:
+            if r["k_mult"] == k_mult:
+                Ns.append(r["N"])
+                dpo_early.append(r["dpo_curve_mean"][50])
+                ggdpo_early.append(r["ggdpo_curve_mean"][50])
+        c = colors_km[k_mult]
+        ax3.plot(Ns, dpo_early, marker='o', linestyle='--', alpha=0.4, color=c)
+        ax3.plot(Ns, ggdpo_early, marker='s', color=c, label=f'K={k_mult}x N')
+
+    ax3.set_xlabel("N")
+    ax3.set_ylabel("Agreement at Step 50")
+    ax3.set_title("Early Convergence (Step 50)\n(solid=GGDPO, dashed=DPO)", fontweight='bold')
+    ax3.legend(fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    plt.suptitle("Convergence Analysis", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp9_analysis.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Plot 4: Full grid of convergence curves (N x K_mult) ---
+    fig, axes = plt.subplots(len(N_VALUES), len(K_MULTIPLIERS),
+                              figsize=(4*len(K_MULTIPLIERS), 3*len(N_VALUES)),
+                              squeeze=False)
+
+    for r in all_results:
+        ni = N_VALUES.index(r["N"])
+        ki = K_MULTIPLIERS.index(r["k_mult"])
+        ax = axes[ni][ki]
+
+        steps = np.arange(EPOCHS + 1)
+        dpo_m = np.array(r["dpo_curve_mean"])
+        dpo_s = np.array(r["dpo_curve_std"])
+        ggdpo_m = np.array(r["ggdpo_curve_mean"])
+        ggdpo_s = np.array(r["ggdpo_curve_std"])
+
+        ax.plot(steps, dpo_m, color='#2196F3', linewidth=1, label='DPO')
+        ax.fill_between(steps, dpo_m - dpo_s, dpo_m + dpo_s, alpha=0.1, color='#2196F3')
+        ax.plot(steps, ggdpo_m, color='#FF5722', linewidth=1, label='GGDPO')
+        ax.fill_between(steps, ggdpo_m - ggdpo_s, ggdpo_m + ggdpo_s, alpha=0.1, color='#FF5722')
+
+        ax.set_title(f"N={r['N']}, K={r['K']} ({r['expansion_factor']:.1f}x expansion)",
+                     fontsize=8, fontweight='bold')
+        ax.set_ylim(0.35, 1.0)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.2)
+
+        if ni == 0 and ki == 0:
+            ax.legend(fontsize=6)
+        if ni == len(N_VALUES) - 1:
+            ax.set_xlabel("Step", fontsize=8)
+        if ki == 0:
+            ax.set_ylabel("Agreement", fontsize=8)
+
+    plt.suptitle("Full Grid: GGDPO vs DPO Convergence\n"
+                 "(rows=N completions, columns=K multiplier, shading=+/-1 std)",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "exp9_full_grid.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    results_vol.commit()
+
+    total_time = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"EXPERIMENT 9 COMPLETE in {total_time:.0f}s ({total_time/60:.1f}min)")
+    print(f"{'='*70}")
+
+    # Print summary table
+    print(f"\n{'N':>3} {'K':>4} {'mult':>4} | {'DPO final':>10} {'GGDPO final':>12} | "
+          f"{'DPO AUC':>8} {'GGDPO AUC':>10} | {'S@70':>5} {'S@75':>5} {'S@80':>5}")
+    print("-" * 90)
+    for r in all_results:
+        s70 = r["thresholds"].get("0.7", {}).get("speedup_median")
+        s75 = r["thresholds"].get("0.75", {}).get("speedup_median")
+        s80 = r["thresholds"].get("0.8", {}).get("speedup_median")
+        print(f"{r['N']:>3} {r['K']:>4} {r['k_mult']:>4.1f} | "
+              f"{r['dpo_final_mean']:>5.3f}+/-{r['dpo_final_std']:.3f} "
+              f"{r['ggdpo_final_mean']:>6.3f}+/-{r['ggdpo_final_std']:.3f} | "
+              f"{r['dpo_auc_mean']:>8.4f} {r['ggdpo_auc_mean']:>10.4f} | "
+              f"{f'{s70:.2f}' if s70 else 'N/A':>5} "
+              f"{f'{s75:.2f}' if s75 else 'N/A':>5} "
+              f"{f'{s80:.2f}' if s80 else 'N/A':>5}")
